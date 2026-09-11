@@ -1,0 +1,39 @@
+services:
+  # Крипто-бот Bitget (USDT-M Futures)
+  ict_crypto:
+    container_name: ict_crypto
+    build: .
+    restart: unless-stopped
+    command: python -u live_trade.py --all --real --yes --asian-range --risk 1.0 --max-pos 5
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # Бот Мосбиржи (Т-Банк Инвестиции)
+  ict_tbank:
+    container_name: ict_tbank
+    build: .
+    restart: unless-stopped
+    command: python -u tbank_trade.py --tickers SBER,ROSN,T,GAZP --real --yes --risk 1.0 --max-pos 5
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # Интерактивный Telegram-бот (команды /stats, /positions, /balance)
+  ict_telegram_bot:
+    container_name: ict_telegram_bot
+    build: .
+    restart: unless-stopped
+    command: python -u telegram_bot.py
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1

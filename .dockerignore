@@ -1,0 +1,6 @@
+ict_env/
+__pycache__/
+*.pyc
+.git/
+.vscode/
+.idea/
