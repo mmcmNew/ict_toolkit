@@ -1,0 +1,60 @@
+{
+  "report_generated_at": "2026-09-11T03:09:07.542356",
+  "market_summary": {
+    "date": "2026-09-08",
+    "symbol": "BTC/USDT",
+    "day_open": 79115.0,
+    "day_close": 78454.0,
+    "day_high": 79495.32,
+    "day_low": 77627.44,
+    "day_range_pct": 2.41,
+    "net_change_pct": -0.84,
+    "total_bars_1m": 1440
+  },
+  "executed_trades": [
+    {
+      "symbol": "BTC/USDT",
+      "sweep_time": "2026-09-08 01:20:00",
+      "dir": "SHORT",
+      "fill_time": "2026-09-08 01:36:00",
+      "fill_price": 79365.0,
+      "stop": 79531.402,
+      "target": 79032.196,
+      "exit_time": "2026-09-08 03:31:00",
+      "exit_price": 78898.632,
+      "outcome": "PARTIAL+TRAIL",
+      "R": 2.02
+    }
+  ],
+  "missed_setups": [
+    {
+      "sweep_time": "2026-09-09 08:10:00",
+      "dir": "SHORT",
+      "bias": "BULLISH",
+      "reason_filtered": "COUNTER_HTF_BIAS",
+      "in_killzone": true,
+      "zone_pct": null,
+      "hypothetical_outcome": "WOULD_STOP"
+    },
+    {
+      "sweep_time": "2026-09-09 22:05:00",
+      "dir": "LONG",
+      "bias": "BEARISH",
+      "reason_filtered": "COUNTER_HTF_BIAS",
+      "in_killzone": false,
+      "zone_pct": null,
+      "hypothetical_outcome": "WOULD_STOP"
+    }
+  ],
+  "ai_analysis": {
+    "market_regime": "CHOPPY/RANGE (диапазон 2.41%, изменение -0.84%)",
+    "trades_postmortem": "Совершено 1 сделок: 1 прибыльных, 0 стопов. Итог дня: +2.02R.",
+    "filter_audit": "Фильтры отсеяли 2 свипов. Из них фильтры спасли от 2 стоп-лоссов, но пропустили 0 потенциальных тейков 2R. Фильтры сработали эффективно в защиту капитала.",
+    "actionable_hypotheses": [
+      "Проверить калибровку MAX_FVG_ZONE_PCT: зафиксировано 0 отсевов по ширине гэпа.",
+      "Передать этот JSON агенту Antigravity для пакетного бэктеста альтернативных параметров."
+    ],
+    "proposed_agent_prompt": "Antigravity, изучи daily_review за 2026-09-08: было пропущено 0 винов из-за фильтров. Протестируй расширение FVG до 0.008 на BTC и ETH.",
+    "source": "rule_based_fallback"
+  }
+}

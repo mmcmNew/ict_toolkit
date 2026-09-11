@@ -1,0 +1,39 @@
+# Секретные ключи и токены API (КРИТИЧЕСКИ ВАЖНО НЕ КОММИТИТЬ)
+.env
+*.env
+*.env.local
+
+# Виртуальные окружения Python
+ict_env/
+ict_tink_env/
+venv/
+env/
+.venv/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Локальный кэш рыночных котировок (тяжелые CSV)
+cache/
+data_cache.csv
+
+# Сгенерированные HTML дашборды
+dashboard*.html
+
+# Журналы сделок и состояние бота
+*.log
+live_seen_signals.json
+tbank_seen_signals.json
+live_trade_log.json
+tbank_trade_log.json
+
+# Временные архивы
+*.zip
+*.tar.gz
+
+# Настройки IDE
+.vscode/
+.idea/
+.DS_Store
