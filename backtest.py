@@ -130,32 +130,59 @@ def simulate(df_1m: pd.DataFrame, df_htf: pd.DataFrame, df_ltf: pd.DataFrame,
         target_partial = (fill_price + cfg.PARTIAL_TAKE_R * risk if c["expected_dir"] == 1
                           else fill_price - cfg.PARTIAL_TAKE_R * risk)
 
+        use_be = getattr(cfg, "USE_BREAKEVEN", False)
+        be_trigger_r = getattr(cfg, "BREAKEVEN_TRIGGER_R", 1.0)
+        fee_cost = fill_price * cfg.FEE_SLIPPAGE_PCT
+        be_stop = (fill_price + fee_cost if c["expected_dir"] == 1 else fill_price - fee_cost)
+        be_trigger_price = (fill_price + be_trigger_r * risk if c["expected_dir"] == 1
+                            else fill_price - be_trigger_r * risk)
+
         future = df_1m[df_1m.index > fill_time].head(cfg.MAX_HOLD_MIN)
         if len(future) == 0:
             continue
 
         hit_partial_time, stopped = None, False
+        is_be_activated = False
+        current_stop = stop
+
         for t, r in future.iterrows():
             if c["expected_dir"] == 1:
-                if r["low"] <= stop:
+                # Триггер перевода в безубыток
+                if use_be and not is_be_activated and r["high"] >= be_trigger_price:
+                    is_be_activated = True
+                    current_stop = max(current_stop, be_stop)
+
+                if r["low"] <= current_stop:
                     stopped = True; break
                 if r["high"] >= target_partial:
                     hit_partial_time = t; break
             else:
-                if r["high"] >= stop:
+                if use_be and not is_be_activated and r["low"] <= be_trigger_price:
+                    is_be_activated = True
+                    current_stop = min(current_stop, be_stop)
+
+                if r["high"] >= current_stop:
                     stopped = True; break
                 if r["low"] <= target_partial:
                     hit_partial_time = t; break
 
         if stopped:
-            r_net = -1.0 - (fill_price * cfg.FEE_SLIPPAGE_PCT) / risk
+            if is_be_activated:
+                r_net = 0.0  # чистый безубыток с учетом покрытия комиссии
+                outcome = "BE_STOP"
+            else:
+                r_net = -1.0 - (fill_price * cfg.FEE_SLIPPAGE_PCT) / risk
+                outcome = "STOP"
+
             trade_row = dict(
                 symbol=symbol, sweep_time=c["sweep_time"],
                 dir="LONG" if c["expected_dir"] == 1 else "SHORT",
                 fill_time=fill_time, fill_price=round(fill_price, 4),
                 stop=round(stop, 4), target=round(target_partial, 4),
-                exit_time=t, exit_price=round(stop, 4),
-                outcome="STOP", R=round(r_net, 3)
+                exit_time=t, exit_price=round(current_stop, 4),
+                outcome=outcome, R=round(r_net, 3),
+                is_asian_sweep=c.get("is_asian_sweep", False),
+                has_smt=c.get("has_smt", False)
             )
             if use_ai:
                 trade_row["ai_score"] = ai_score
@@ -287,6 +314,27 @@ def analyze_discrepancies(summary_df: pd.DataFrame):
                       f"Возможна чувствительность к затяжному макро-тренду.")
 
 
+def parse_killzone_ranges(hours_str: str, is_msk: bool = False) -> list[tuple[int, int]]:
+    """
+    Парсит строку диапазонов часов вида '11-15' или '8-12,14-17'.
+    Если is_msk=True, переводит часы MSK -> UTC (-3 часа).
+    """
+    ranges = []
+    for part in hours_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        tokens = part.split("-")
+        if len(tokens) == 2:
+            s_h = int(tokens[0].strip())
+            e_h = int(tokens[1].strip())
+            if is_msk:
+                s_h = (s_h - 3) % 24
+                e_h = (e_h - 3) % 24
+            ranges.append((s_h, e_h))
+    return ranges
+
+
 def main():
     parser = argparse.ArgumentParser(description="ICT Multi-Instrument Backtest & AI Evaluator")
     parser.add_argument("--source", type=str, default=None, choices=["ccxt", "tbank", "tinkoff", "github_csv"],
@@ -295,28 +343,102 @@ def main():
                         help="Список тикеров через запятую (например, BTC/USDT,ETH/USDT или SBER,GAZP,LKOH)")
     parser.add_argument("--all", action="store_true", help="Запустить по всей корзине инструментов")
     parser.add_argument("--symbol", "--ticker", dest="symbol", type=str, default=None, help="Одиночный инструмент/тикер")
-    parser.add_argument("--ai", action="store_true", help="Включить ИИ-оценку сетапов")
-    parser.add_argument("--ai-filter", action="store_true", help="Отсеивать сетапы с низкой оценкой ИИ")
-    parser.add_argument("--killzones", action="store_true", help="Торговать строго внутри Killzones (London/NY)")
+    parser.add_argument("--exclude", type=str, default=None,
+                        help="Список тикеров для исключения через запятую (например, GAZP,T)")
+
+    # Фильтр по направлению сделок
+    parser.add_argument("--direction", "--dir", dest="direction", type=str, choices=["all", "long", "short"], default="all",
+                        help="Направление сделок: all (по умолчанию), long (только покупки), short (только продажи)")
+    parser.add_argument("--long-only", action="store_true", help="Торговать только в LONG")
+    parser.add_argument("--short-only", action="store_true", help="Торговать только в SHORT")
+
+    # Киллзоны (Killzones)
+    parser.add_argument("--killzones", action="store_true", help="Торговать строго внутри Killzones")
+    parser.add_argument("--kz-start", type=int, default=None, help="Час начала киллзоны (0-23)")
+    parser.add_argument("--kz-end", type=int, default=None, help="Час окончания киллзоны (0-23)")
+    parser.add_argument("--kz-hours", type=str, default=None, help="Диапазоны часов киллзон, например '8-12' или '11-15,16-18'")
+    parser.add_argument("--kz-msk", type=str, default=None, help="Диапазоны киллзон по Москве (MSK = UTC+3), например '11-15'")
+    parser.add_argument("--msk", action="store_true", help="Интерпретировать часы киллзоны (--kz-start/end, --kz-hours) как Московское время MSK (UTC+3)")
+
+    # Дополнительные ICT фильтры и ИИ
     parser.add_argument("--smt", action="store_true", help="Требовать подтверждения SMT-дивергенцией (BTC vs ETH)")
     parser.add_argument("--asian-range", action="store_true", help="Требовать свип уровней Азиатской сессии")
+    parser.add_argument("--ai", action="store_true", help="Включить ИИ-оценку сетапов")
+    parser.add_argument("--ai-filter", action="store_true", help="Отсеивать сетапы с низкой оценкой ИИ")
+
+    # Тюнинг параметров стратегии и риск-менеджмента
+    parser.add_argument("--partial-r", type=float, default=None, help="Уровень первого частичного тейка в R (по умолчанию 1.5)")
+    parser.add_argument("--partial-size", type=float, default=None, help="Доля позиции для частичного тейка (по умолчанию 0.5)")
+    parser.add_argument("--trail-r", type=float, default=None, help="Дистанция трейлинг-стопа в R (по умолчанию 0.8)")
+    parser.add_argument("--be", "--breakeven", dest="breakeven", action="store_true",
+                        help="Переводить стоп в безубыток при достижении порога прибыли в R")
+    parser.add_argument("--be-r", "--be-trigger-r", dest="be_r", type=float, default=None,
+                        help="Порог в R для перевода стопа в безубыток (по умолчанию 1.0R)")
+    parser.add_argument("--max-fvg", type=float, default=None, help="Макс. допустимый размер FVG в долях цены (по умолчанию 0.006)")
+    parser.add_argument("--min-risk", type=float, default=None, help="Мин. допустимый риск/стоп в долях цены (по умолчанию 0.002)")
 
     args = parser.parse_args()
 
     if args.source:
         cfg.DATA_SOURCE = args.source
 
-    if args.killzones:
+    is_tbank = cfg.DATA_SOURCE in ("tbank", "tinkoff")
+
+    # Применение фильтра направления
+    if args.long_only:
+        cfg.DIRECTION_FILTER = "long"
+    elif args.short_only:
+        cfg.DIRECTION_FILTER = "short"
+    elif args.direction:
+        cfg.DIRECTION_FILTER = args.direction.lower()
+
+    # Настройка киллзон
+    custom_kz = False
+    if args.kz_msk:
+        cfg.KILLZONES = parse_killzone_ranges(args.kz_msk, is_msk=True)
         cfg.USE_KILLZONES = True
+        custom_kz = True
+    elif args.kz_hours:
+        cfg.KILLZONES = parse_killzone_ranges(args.kz_hours, is_msk=args.msk)
+        cfg.USE_KILLZONES = True
+        custom_kz = True
+    elif args.kz_start is not None and args.kz_end is not None:
+        s_h, e_h = args.kz_start, args.kz_end
+        if args.msk:
+            s_h = (s_h - 3) % 24
+            e_h = (e_h - 3) % 24
+        cfg.KILLZONES = [(s_h, e_h)]
+        cfg.USE_KILLZONES = True
+        custom_kz = True
+    elif args.killzones:
+        cfg.USE_KILLZONES = True
+        if is_tbank and not custom_kz:
+            cfg.KILLZONES = getattr(cfg, "MOEX_KILLZONES", [(8, 12)])
+
     if args.smt:
         cfg.USE_SMT_FILTER = True
     if args.asian_range:
         cfg.USE_ASIAN_RANGE_FILTER = True
 
+    # Тюнинг параметров стратегии
+    if args.partial_r is not None:
+        cfg.PARTIAL_TAKE_R = args.partial_r
+    if args.partial_size is not None:
+        cfg.PARTIAL_TAKE_SIZE = args.partial_size
+    if args.trail_r is not None:
+        cfg.TRAIL_DISTANCE_R = args.trail_r
+    if args.breakeven:
+        cfg.USE_BREAKEVEN = True
+    if args.be_r is not None:
+        cfg.BREAKEVEN_TRIGGER_R = args.be_r
+        cfg.USE_BREAKEVEN = True
+    if args.max_fvg is not None:
+        cfg.MAX_FVG_ZONE_PCT = args.max_fvg
+    if args.min_risk is not None:
+        cfg.MIN_RISK_PCT = args.min_risk
+
     use_ai = args.ai or getattr(cfg, "ENABLE_AI_EVALUATION", False) or args.ai_filter
     ai_filter = args.ai_filter
-
-    is_tbank = cfg.DATA_SOURCE in ("tbank", "tinkoff")
 
     # Определение списка инструментов
     if args.symbols:
@@ -334,6 +456,11 @@ def main():
         else:
             target_symbols = getattr(cfg, "SYMBOLS", [getattr(cfg, "SYMBOL", "BTC/USDT")])
 
+    # Исключение инструментов
+    if args.exclude:
+        excludes = [s.strip().upper() for s in args.exclude.split(",") if s.strip()]
+        target_symbols = [s for s in target_symbols if s.upper() not in excludes]
+
     # Прекалькуляция SMT сигналов между BTC и ETH (только для крипты)
     smt_df = None
     if not is_tbank and getattr(cfg, "USE_SMT_FILTER", False):
@@ -348,11 +475,33 @@ def main():
         except Exception as e:
             smt_df = None
 
+    # Формирование описания киллзоны
+    if cfg.USE_KILLZONES:
+        kz_desc_utc = ", ".join(f"{a:02d}:00-{b:02d}:00 UTC" for a, b in cfg.KILLZONES)
+        kz_desc_msk = ", ".join(f"{(a+3)%24:02d}:00-{(b+3)%24:02d}:00 MSK" for a, b in cfg.KILLZONES)
+        kz_info = f"ВКЛ [{kz_desc_utc} / {kz_desc_msk}]"
+    else:
+        kz_info = "ВЫКЛ (Круглосуточно)"
+
+    dir_info = getattr(cfg, "DIRECTION_FILTER", "all").upper()
+    if dir_info == "ALL":
+        dir_str = "LONG + SHORT"
+    elif dir_info == "LONG":
+        dir_str = "ТОЛЬКО LONG"
+    else:
+        dir_str = "ТОЛЬКО SHORT"
+
     print("="*80)
     print(f"ICT BACKTEST RUNNER | Источник: {cfg.DATA_SOURCE} | Инструментов: {len(target_symbols)}")
     print(f"Инструменты: {', '.join(target_symbols)}")
-    print(f"Фильтры: Killzones={cfg.USE_KILLZONES} | SMT={getattr(cfg, 'USE_SMT_FILTER', False)} | AsianRange={getattr(cfg, 'USE_ASIAN_RANGE_FILTER', False)}")
-    print(f"ИИ-оценка: {'ВКЛЮЧЕНА (фильтрация: ' + str(ai_filter) + ')' if use_ai else 'ВЫКЛЮЧЕНА'}")
+    if args.exclude:
+        print(f"Исключены:   {args.exclude}")
+    print(f"Направление: {dir_str}")
+    print(f"Киллзоны:    {kz_info}")
+    print(f"Фильтры:     SMT={getattr(cfg, 'USE_SMT_FILTER', False)} | AsianRange={getattr(cfg, 'USE_ASIAN_RANGE_FILTER', False)}")
+    be_str = f"ВКЛ ({cfg.BREAKEVEN_TRIGGER_R:.1f}R)" if getattr(cfg, "USE_BREAKEVEN", False) else "ВЫКЛ"
+    print(f"Параметры:   TP={cfg.PARTIAL_TAKE_R}R ({cfg.PARTIAL_TAKE_SIZE*100:.0f}%) | Trail={cfg.TRAIL_DISTANCE_R}R | BE={be_str} | Max FVG={cfg.MAX_FVG_ZONE_PCT*100:.2f}% | Min Stop={cfg.MIN_RISK_PCT*100:.2f}%")
+    print(f"ИИ-оценка:   {'ВКЛЮЧЕНА (фильтрация: ' + str(ai_filter) + ')' if use_ai else 'ВЫКЛЮЧЕНА'}")
     print("="*80)
 
     all_trades = []

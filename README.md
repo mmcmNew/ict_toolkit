@@ -108,14 +108,26 @@ python test_tbank.py --sandbox --fund
 
 ### 3. Бэктест на исторических данных Мосбиржи
 ```bash
-# Бэктест всей корзины акций РФ по очереди (SBER, GAZP, LKOH, ROSN, YDEX, T):
+# Базовый бэктест всей корзины акций РФ (SBER, GAZP, LKOH, ROSN, YDEX, T):
 python backtest.py --all --source tbank
 
-# Бэктест конкретных выбранных акций:
-python backtest.py --tickers SBER,LKOH,YDEX --source tbank
+# Оптимальный режим: Киллзона Мосбиржи 11:00 - 15:00 МСК (WR 64.3%, PF 2.07):
+python backtest.py --all --source tbank --kz-msk 11-15
 
-# Бэктест одной акции:
-python backtest.py --ticker SBER --source tbank
+# Торговля в произвольных часах (например, с 10:00 до 16:00 по Москве):
+python backtest.py --all --source tbank --kz-start 10 --kz-end 16 --msk
+
+# Ядро портфеля без аутсайдеров GAZP и T (WR 67.3%, PF 2.41, Max DD всего 4.96R):
+python backtest.py --all --source tbank --kz-msk 11-15 --exclude GAZP,T
+
+# Только шорты (наиболее прибыльный режим на коррекциях рынка, WR 68.1%, PF 2.41):
+python backtest.py --all --source tbank --kz-msk 11-15 --direction short
+
+# Бэктест конкретных выбранных акций:
+python backtest.py --tickers SBER,LKOH,YDEX --source tbank --kz-msk 11-15
+
+# Бэктест одной акции (Сбербанк) только в Лонг:
+python backtest.py --ticker SBER --source tbank --long-only
 ```
 
 ### 4. Запуск торгового бота Т-Банка (`tbank_trade.py`)
