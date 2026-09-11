@@ -14,15 +14,26 @@ DATA_SOURCE = "ccxt"
 # --- ccxt (крипта) ---
 CCXT_EXCHANGE = "bitget"
 SYMBOL = "BTC/USDT"          # одиночный символ (для обратной совместимости)
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]  # 5 пар для тестирования
+SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT"]
 SWAP_SYMBOL = "BTC/USDT:USDT"  # для live-исполнения - бессрочный фьючерс (нужен для SHORT)
 SWAP_SYMBOLS = {
+    "DOGE/USDT": "DOGE/USDT:USDT",
+    "ADA/USDT": "ADA/USDT:USDT",
+    "XRP/USDT": "XRP/USDT:USDT",
+    "BNB/USDT": "BNB/USDT:USDT",
+    "SOL/USDT": "SOL/USDT:USDT",
     "BTC/USDT": "BTC/USDT:USDT",
     "ETH/USDT": "ETH/USDT:USDT",
-    "SOL/USDT": "SOL/USDT:USDT",
-    "BNB/USDT": "BNB/USDT:USDT",
-    "XRP/USDT": "XRP/USDT:USDT",
 }
+
+# Корзина с ультра-низким минимальным лотом (мин. контракт $5.00-$7.25, плечо 1x при балансе от $10)
+SMALL_ACCOUNT_SYMBOLS = [
+    "DOGE/USDT:USDT",
+    "ADA/USDT:USDT",
+    "XRP/USDT:USDT",
+    "BNB/USDT:USDT",
+    "SOL/USDT:USDT",
+]
 
 # --- Кэш данных и отчёты ---
 CACHE_DIR = "cache"
@@ -41,6 +52,7 @@ BITGET_API_SECRET = _os.environ.get("BITGET_API_SECRET", "")
 BITGET_API_PASSWORD = _os.environ.get("BITGET_API_PASSWORD", "")  # Bitget требует passphrase
 DEMO_MODE = True   # True = демо-счёт (PAPTRADING), False = РЕАЛЬНЫЕ ДЕНЬГИ
 LEVERAGE = int(_os.environ.get("LEVERAGE", "3"))
+MARGIN_MODE = _os.environ.get("MARGIN_MODE", "isolated")  # "isolated" (изолированная) | "cross" (кросс)
 
 # --- Риск-менеджмент и дисциплина (Prop-Firm Grade) ---
 RISK_PER_TRADE_PCT = float(_os.environ.get("RISK_PER_TRADE_PCT", "1.0"))  # Базовый риск: 1% от баланса
@@ -69,6 +81,13 @@ SSL_TBANK_VERIFY = _os.environ.get("SSL_TBANK_VERIFY", "True").lower() in ("true
 TINKOFF_TOKEN = TBANK_TOKEN
 TINKOFF_FIGI = TBANK_FIGI
 
+# --- Telegram Уведомления ---
+TELEGRAM_BOT_TOKEN = _os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = _os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_PROXY = _os.environ.get("TELEGRAM_PROXY", "")
+TELEGRAM_BASE_URL = _os.environ.get("TELEGRAM_BASE_URL", "")
+TELEGRAM_NOTIFICATIONS_ENABLED = _os.environ.get("TELEGRAM_NOTIFICATIONS_ENABLED", "True").lower() in ("true", "1", "yes")
+
 # --- Запасной источник: готовый CSV с github ---
 GITHUB_CSV_URL = "https://raw.githubusercontent.com/ff137/bitstamp-btcusd-minute-data/main/data/updates/btcusd_bitstamp_1min_latest.csv"
 
@@ -83,7 +102,11 @@ LTF_RULE = "5min"        # sweep + FVG + вход
 
 # ---- Killzones (UTC, приближённо, без учёта перехода на летнее время) ----
 USE_KILLZONES = False  # False = торговать круглосуточно; True = строго в Killzones
-KILLZONES = [(7, 10), (12, 15)]  # London (07-10 UTC), New York (12-15 UTC)
+KILLZONES = [(7, 10), (12, 15)]  # London (07-10 UTC), New York (12-15 UTC) для крипты
+MOEX_KILLZONES = [(8, 12)]       # 11:00 - 15:00 МСК (в UTC: 08:00 - 12:00) золотое окно Мосбиржи
+
+# ---- Фильтр направления ('all' | 'long' | 'short') ----
+DIRECTION_FILTER = "all"
 
 # ---- Продвинутые ICT-фильтры (SMT & Asian Range) ----
 USE_SMT_FILTER = False          # True = входить только при подтверждении SMT-дивергенцией (BTC vs ETH)
@@ -106,6 +129,10 @@ STOP_MODE = "wick"
 PARTIAL_TAKE_R = 1.5     # частичный тейк на 1.5R (повышает винрейт до 57%+)
 PARTIAL_TAKE_SIZE = 0.5  # доля позиции, закрываемая на частичном тейке
 TRAIL_DISTANCE_R = 0.8   # трейлинг остатка на 0.8R за экстремумом
+
+# ---- Перенос стопа в безубыток (Break-Even) ----
+USE_BREAKEVEN = False       # True = переносить стоп в безубыток до достижения тейка
+BREAKEVEN_TRIGGER_R = 1.0   # порог в R для перевода стопа в безубыток (с учетом комиссий)
 
 # ---- Окна поиска/удержания (в минутах, на базовом 1м TF) ----
 MAX_WAIT_MIN = 120        # сколько ждём возврата цены в FVG-зону (2 часа, исключает тухлые входы)

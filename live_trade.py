@@ -36,9 +36,10 @@ import pandas as pd
 from smartmoneyconcepts import smc
 
 import config as cfg
-from strategy import resample, compute_bias_series, bias_at, in_killzone
+from strategy import resample, compute_bias_series, bias_at, in_killzone, get_next_killzone_delta
 from ict_advanced import compute_asian_ranges, is_asian_range_sweep
 from ai_evaluator import evaluate_setup
+import telegram_notifier as tg
 
 SEEN_SIGNALS_PATH = "live_seen_signals.json"
 TRADE_LOG_PATH = "live_trade_log.json"
@@ -125,10 +126,15 @@ def calculate_position_size(exchange, swap_symbol, entry_price, stop_price, risk
     stop_dist = abs(entry_price - stop_price)
     stop_dist_pct = stop_dist / entry_price
 
-    if stop_dist_pct <= 0:
+    # Учет комиссий биржи в бюджете риска (Net Risk Sizing):
+    # При срабатывании стопа сумма (убыток по цене + комиссии) строго равна risk_usd (1.0% депозита)
+    fee_roundtrip_pct = cfg.BITGET_TAKER_FEE_PCT * 2  # 0.06% open + 0.06% close = 0.12%
+    effective_risk_pct = stop_dist_pct + fee_roundtrip_pct
+
+    if effective_risk_pct <= 0:
         target_pos_usd = cfg.POSITION_SIZE_USDT
     else:
-        target_pos_usd = risk_usd / stop_dist_pct
+        target_pos_usd = risk_usd / effective_risk_pct
 
     # Ограничение позиции максимальным плечом и свободной маржой
     max_by_leverage = equity * leverage * 0.90
@@ -172,20 +178,23 @@ def calculate_position_size(exchange, swap_symbol, entry_price, stop_price, risk
     }
 
 
-def init_exchange(demo_mode=True, leverage=None):
+def init_exchange(demo_mode=True, leverage=None, margin_mode=None, skip_confirm=False):
     api_key = cfg.BITGET_API_KEY
     api_secret = cfg.BITGET_API_SECRET
     api_pass = cfg.BITGET_API_PASSWORD
 
     if not (api_key and api_secret and api_pass):
-        print("\n" + "=" * 70)
-        print("ОШИБКА: Не заданы ключи Bitget API!")
-        print("Создайте файл .env на основе .env.example и укажите:")
-        print("  BITGET_API_KEY=...")
-        print("  BITGET_API_SECRET=...")
-        print("  BITGET_API_PASSWORD=... (passphrase)")
-        print("=" * 70 + "\n")
-        raise RuntimeError("Отсутствуют учетные данные Bitget API.")
+        print("\n❌ ОШИБКА: Не заданы API-ключи Bitget!")
+        print("Открой файл .env и заполни параметры:")
+        print("  BITGET_API_KEY=твой_ключ")
+        print("  BITGET_API_SECRET=твой_секрет")
+        print("  BITGET_API_PASSWORD=твой_пароль_passphrase")
+        print("\nИнструкция:")
+        print("  1. Зайди на bitget.com -> Профиль -> Управление API -> Создать API-ключ")
+        print("  2. Выбери тип 'Торговля по API' (API trading)")
+        print("  3. Обязательно отметь галочку 'Фьючерсы' (USDT-M Futures: чтение и торговля)")
+        print("  4. Задай Passphrase (парольную фразу) и сохрани ее в BITGET_API_PASSWORD\n")
+        raise RuntimeError("API-ключи Bitget не настроены.")
 
     exchange = ccxt.bitget({
         "apiKey": api_key,
@@ -200,9 +209,12 @@ def init_exchange(demo_mode=True, leverage=None):
     else:
         print("🔴 ВНИМАНИЕ: РЕЖИМ РЕАЛЬНОЙ ТОРГОВЛИ (DEMO_MODE=False)!")
         print("Вы собираетесь размещать ордера на реальном депозите.")
-        confirm = input("Введи 'ДА' заглавными буквами для подтверждения запуска: ")
-        if confirm != "ДА":
-            raise SystemExit("Запуск отменен пользователем.")
+        if not skip_confirm:
+            confirm = input("Введи 'ДА' заглавными буквами для подтверждения запуска: ")
+            if confirm != "ДА":
+                raise SystemExit("Запуск отменен пользователем.")
+        else:
+            print("✅ Запуск на реальном счете подтвержден флагом --yes.")
 
     exchange.load_markets()
 
@@ -210,13 +222,33 @@ def init_exchange(demo_mode=True, leverage=None):
     bal = get_account_balance(exchange)
     print(f"💰 Баланс аккаунта: {bal['free']:.2f} USDT свободно (Equity: {bal['equity']:.2f} USDT)")
 
-    # Выставляем плечо и включаем двусторонний режим (Hedge Mode)
+    # Выставляем режим маржи (isolated / cross), плечо и включаем двусторонний режим (Hedge Mode)
     lev = leverage or cfg.LEVERAGE
+    m_mode = (margin_mode or getattr(cfg, "MARGIN_MODE", "isolated")).lower()
+    if m_mode == "cross":
+        m_mode = "crossed"
+
     for sym in list(cfg.SWAP_SYMBOLS.values()):
+        # 1. Установка маржинального режима
         try:
-            exchange.set_leverage(lev, sym)
+            exchange.set_margin_mode(m_mode, sym)
         except Exception:
             pass
+
+        # 2. Установка плеча (в Isolated на Bitget требуется holdSide='long'/'short')
+        try:
+            if m_mode == "isolated":
+                exchange.set_leverage(lev, sym, params={"holdSide": "long"})
+                exchange.set_leverage(lev, sym, params={"holdSide": "short"})
+            else:
+                exchange.set_leverage(lev, sym)
+        except Exception:
+            try:
+                exchange.set_leverage(lev, sym)
+            except Exception:
+                pass
+
+        # 3. Включение Hedge Mode
         try:
             exchange.set_position_mode(hedged=True, symbol=sym)
         except Exception:
@@ -236,7 +268,7 @@ def fetch_recent(exchange, swap_symbol, timeframe="1m", limit=1000):
         return None
 
 
-def place_bracket_order(exchange, swap_symbol, direction, entry_price, stop, target, pos_calc):
+def place_bracket_order(exchange, swap_symbol, direction, entry_price, stop, target, pos_calc, setup_reason: dict = None):
     side = "buy" if direction == 1 else "sell"
     amount = pos_calc["amount"]
 
@@ -270,6 +302,7 @@ def place_bracket_order(exchange, swap_symbol, direction, entry_price, stop, tar
         "gross_pnl": 0.0,
         "net_pnl": 0.0,
         "net_r": 0.0,
+        "setup_reason": setup_reason,
     }
 
     trades = load_trades()
@@ -281,6 +314,18 @@ def place_bracket_order(exchange, swap_symbol, direction, entry_price, stop, tar
     print(f"   🛑 Stop-Loss:   {stop:.4f} (-{pos_calc['stop_dist_pct']*100:.2f}%)")
     print(f"   🎯 Take-Profit: {target:.4f} (+{pos_calc['stop_dist_pct']*cfg.PARTIAL_TAKE_R*100:.2f}%, 1.5R)")
     print(f"   💳 Комиссия входа: ~${pos_calc['est_open_fee']:.3f} | ID: {order.get('id')}\n")
+
+    tg.notify_trade_opened(
+        market="Bitget Crypto",
+        symbol=swap_symbol,
+        direction="LONG" if direction == 1 else "SHORT",
+        entry_price=entry_price,
+        stop_loss=stop,
+        take_profit=target,
+        amount_str=f"{amount} (~{pos_calc['position_usdt']:.2f} USDT)",
+        risk_str=f"{pos_calc['risk_pct']:.1f}% (~${pos_calc['risk_usd']:.2f} USDT)",
+        setup_reason=setup_reason,
+    )
 
     return order
 
@@ -345,6 +390,18 @@ def reconcile_open_trades(exchange):
                 print(f"   Цена выхода: {exit_price:.4f} | Чистый убыток: -${abs(net_pnl):.2f} ({net_r:.2f}R)")
                 print(f"   Уплачено комиссий (Open+Close): ${total_fee:.3f}\n")
 
+            tg.notify_trade_closed(
+                market="Bitget Crypto",
+                symbol=sym,
+                direction=t["direction"],
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                net_pnl=net_pnl,
+                currency="USDT",
+                net_r=net_r,
+                total_fees=total_fee,
+            )
+
     if updated:
         save_trades(trades)
 
@@ -369,6 +426,15 @@ def show_performance_stats():
 
     print(f"Всего ордеров: {len(trades)} | Открытых позиций: {len(open_trades)} | Закрытых: {len(closed)}")
     print("-" * 80)
+
+    if open_trades:
+        print(f"📌 АКТИВНЫЕ ОТКРЫТЫЕ ПОЗИЦИИ ({len(open_trades)}):")
+        for ot in open_trades:
+            sr = ot.get("setup_reason")
+            ai_str = f" | AI: {sr.get('ai_score')}/10" if (isinstance(sr, dict) and sr.get('ai_score')) else ""
+            sr_str = f"\n     ↳ Сетап: {sr.get('bias_desc', '')} свип @ {sr.get('sweep_price', 0):.4f} (FVG: [{sr.get('fvg_bottom', 0):.4f} - {sr.get('fvg_top', 0):.4f}]){ai_str}" if isinstance(sr, dict) else ""
+            print(f"   • {ot['symbol']} | {ot['direction']} {ot['amount']} | Вход: {ot['entry_price']:.4f} | SL: {ot['stop_loss']:.4f} | TP: {ot['take_profit']:.4f}{sr_str}")
+        print("-" * 80)
 
     if not closed:
         print(f"Сейчас открыто {len(open_trades)} позиций, закрытых сделок пока нет.")
@@ -418,6 +484,24 @@ def show_performance_stats():
         s_fees = sum(t.get("total_fee", 0) for t in sym_trades)
         s_r = sum(t.get("net_r", 0) for t in sym_trades)
         print(f"{sym:<18} | {len(sym_trades):<7} | {wr:>6.1f}% | ${s_pnl:>+10.2f} | ${s_fees:>7.2f} | {s_r:>+6.2f}R")
+
+    print("\nПОСЛЕДНИЕ ЗАКРЫТЫЕ СДЕЛКИ:")
+    fmt = "   {:<16} | {:<5} | {:>9} | Вход: {:>9.4f} | Выход: {:>9.4f} | {:>11} | Net R: {:>6.2f}R | Net PnL: {:>+8.2f} USD"
+    for t in closed[-10:]:
+        print(fmt.format(
+            t["symbol"],
+            t["direction"],
+            t["amount"],
+            t["entry_price"],
+            t.get("exit_price") or 0.0,
+            t.get("exit_reason", "N/A"),
+            t.get("net_r", 0.0),
+            t.get("net_pnl", 0.0),
+        ))
+        sr = t.get("setup_reason")
+        if isinstance(sr, dict):
+            ai_str = f" | AI: {sr.get('ai_score')}/10" if sr.get('ai_score') is not None else ""
+            print(f"      ↳ Сетап: {sr.get('bias_desc', '')} свип @ {sr.get('sweep_price', 0):.4f} | FVG: [{sr.get('fvg_bottom', 0):.4f} - {sr.get('fvg_top', 0):.4f}]{ai_str}")
 
     print("=" * 80 + "\n")
 
@@ -511,16 +595,20 @@ def process_symbol(exchange, swap_symbol, seen, args):
         if not (fvg_bottom - buffer_in <= current_price <= fvg_top + buffer_in):
             continue
 
-        # Расчет Стопа и Тейка
+        # Расчет Стопа и Тейка с компенсацией комиссий (Fee-Adjusted Target)
         buffer = current_price * 0.0008
+        fee_roundtrip_pct = cfg.BITGET_TAKER_FEE_PCT * 2  # 0.06% open + 0.06% close = 0.12%
+        fee_price_buffer = current_price * fee_roundtrip_pct
+
         if expected_dir == 1:
             stop = sweep_candle["low"] - buffer
             risk = current_price - stop
-            target = current_price + cfg.PARTIAL_TAKE_R * risk
+            # Надбавка на комиссии, чтобы чистая прибыль после Taker-сборов была строго +1.5R:
+            target = current_price + (cfg.PARTIAL_TAKE_R * risk) + fee_price_buffer
         else:
             stop = sweep_candle["high"] + buffer
             risk = stop - current_price
-            target = current_price - cfg.PARTIAL_TAKE_R * risk
+            target = current_price - (cfg.PARTIAL_TAKE_R * risk) - fee_price_buffer
 
         if risk <= 0 or risk / current_price < cfg.MIN_RISK_PCT:
             seen.add(sig_key)
@@ -528,16 +616,48 @@ def process_symbol(exchange, swap_symbol, seen, args):
 
         # Дисциплинированный расчет размера позиции по риску (% от депозита)
         risk_pct = args.risk if args.risk is not None else cfg.RISK_PER_TRADE_PCT
+        lev = args.leverage or cfg.LEVERAGE
         pos_calc = calculate_position_size(
             exchange=exchange,
             swap_symbol=swap_symbol,
             entry_price=current_price,
             stop_price=stop,
             risk_pct=risk_pct,
-            leverage=args.leverage or cfg.LEVERAGE,
+            leverage=lev,
         )
 
         dir_str = "LONG" if expected_dir == 1 else "SHORT"
+
+        # Фильтр принудительного плеча для небольших депозитов:
+        bal_now = get_account_balance(exchange)
+        if not getattr(args, "force_leverage", False) and pos_calc["position_usdt"] > bal_now["equity"] * 1.05:
+            forced_lev = pos_calc["position_usdt"] / max(bal_now["equity"], 0.01)
+            seen.add(sig_key)
+            print(f"\nℹ️ [{swap_symbol}] СИГНАЛ ПРОПУЩЕН: МИНИМАЛЬНЫЙ ЛОТ ТРЕБУЕТ ПРИНУДИТЕЛЬНОЕ ПЛЕЧО {forced_lev:.1f}x!")
+            print(f"   Позиция биржи: ~${pos_calc['position_usdt']:.2f} USDT при балансе ${bal_now['equity']:.2f} USDT.")
+            print(f"   💡 Торгуем только инструменты 1x без вынужденного заемного плеча (DOGE, ADA, XRP, BNB, SOL). Флаг --force-leverage отключит это ограничение.\n")
+            continue
+
+        # Проверка фактической свободной маржи для открытия
+        req_margin = pos_calc["position_usdt"] / lev
+        if req_margin > bal_now["free"] * 0.95:
+            seen.add(sig_key)
+            print(f"\n⚠️ [{swap_symbol}] СИГНАЛ ПРОПУЩЕН: НЕ ХВАТАЕТ СВОБОДНОЙ МАРЖИ!")
+            print(f"   Сетап:            {dir_str} по {current_price:.4f} (Свип в {sweep_time} UTC | FVG: [{fvg_bottom:.4f} - {fvg_top:.4f}])")
+            print(f"   Требуется маржи:   ~${req_margin:.2f} USDT (при плече {lev}x)")
+            print(f"   Свободно на счете: ${bal_now['free']:.2f} USDT (Equity: ${bal_now['equity']:.2f} USDT)")
+            print(f"   💡 Подсказка:     Пополните счет на ${(req_margin - bal_now['free']):.2f}+ USDT или закройте позицию для входа.\n")
+            tg.notify_margin_warning(
+                market="Bitget Crypto",
+                symbol=swap_symbol,
+                direction=dir_str,
+                price=current_price,
+                required_amount=req_margin,
+                available_amount=bal_now["free"],
+                currency="USDT",
+                hint=f"Пополните счет на ${(req_margin - bal_now['free']):.2f}+ USDT или закройте позицию для входа.",
+            )
+            continue
         print(f"\n⚡ ОБНАРУЖЕН ВАЛИДНЫЙ СЕТАП: {swap_symbol} | {dir_str} по {current_price:.4f}")
         print(f"   Время свипа: {sweep_time} UTC | FVG: [{fvg_bottom:.4f} - {fvg_top:.4f}]")
         print(f"   Расчетный SL: {stop:.4f} | TP (1.5R): {target:.4f}")
@@ -568,6 +688,24 @@ def process_symbol(exchange, swap_symbol, seen, args):
                 seen.add(sig_key)
                 continue
 
+        # Формирование подробного обоснования решения на вход
+        setup_reason = {
+            "bias": bias,
+            "bias_desc": "BULLISH" if expected_dir == 1 else "BEARISH",
+            "sweep_time": str(sweep_time),
+            "sweep_price": float(sweep_candle["low"] if expected_dir == 1 else sweep_candle["high"]),
+            "fvg_bottom": float(fvg_bottom),
+            "fvg_top": float(fvg_top),
+            "fvg_zone_pct": round(float(zone_pct) * 100, 2),
+            "risk_pct": round(float(risk / current_price) * 100, 2),
+            "asian_range_sweep": bool(args.asian_range and is_ar_sweep),
+            "asian_range_type": ar_type if (args.asian_range and is_ar_sweep) else None,
+            "in_killzone": bool(args.killzones and in_killzone(sweep_time, cfg.KILLZONES)),
+            "ai_score": score if args.ai else None,
+            "ai_recommendation": rec if args.ai else None,
+            "ai_reasoning": ai_eval.get("reasoning") if args.ai else None,
+        }
+
         # Исполнение ордера
         try:
             place_bracket_order(
@@ -578,6 +716,7 @@ def process_symbol(exchange, swap_symbol, seen, args):
                 stop=stop,
                 target=target,
                 pos_calc=pos_calc,
+                setup_reason=setup_reason,
             )
         except Exception as e:
             print(f"❌ ОШИБКА размещения ордера на бирже: {e}")
@@ -605,6 +744,8 @@ def print_startup_briefing(exchange, args, target_symbols, risk_pct, demo_mode):
     print(f"   • Баланс депозита (Equity): {equity:.2f} USDT")
     print(f"   • Свободная маржа:        {free_margin:.2f} USDT")
     print(f"   • Рабочее плечо:          {lev}x")
+    m_mode_label = "🔒 ISOLATED (Изолированная - защита баланса от сквизов и проскальзываний)" if getattr(args, "margin_mode", "isolated").lower() == "isolated" else "⚠️ CROSS (Кросс-маржа - общий пул обеспечения)"
+    print(f"   • Режим маржи:            {m_mode_label}")
     print()
     print("🎯 2. РАСЧЕТ РАЗМЕРА СЛЕДУЮЩЕЙ СДЕЛКИ (ДИСЦИПЛИНА РИСКА):")
     print(f"   • Риск на сделку (1R):     {risk_pct:.1f}% от баланса = ${risk_usd:.2f} USD")
@@ -644,11 +785,29 @@ def print_startup_briefing(exchange, args, target_symbols, risk_pct, demo_mode):
         except Exception:
             pass
     print("   " + "-" * 90)
-    if equity < 50:
+    effective_max_pos = args.max_pos if args.max_pos is not None else (1 if equity < 50 else 3)
+    if effective_max_pos == 1:
         print("   💡 ЗАЩИТА ДЕПОЗИТА: Включен Single Position Mode (макс. 1 сделка одновременно).")
         print("      Бот защищает маржу и не откроет новую позицию, пока текущая не закроется в TP или SL.")
+    else:
+        print(f"   🚀 МУЛЬТИ-ПОЗИЦИОННЫЙ РЕЖИМ: Разрешено до {effective_max_pos} одновременных сделок (при наличии свободной маржи).")
     print()
-    print("⚙️ 4. ПАРАМЕТРЫ СТРАТЕГИИ И ФИЛЬТРЫ:")
+
+    # 4. Проверка и отображение активных открытых позиций из журнала
+    trades = load_trades()
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+    if open_trades:
+        print("📌 4. ВОССТАНОВЛЕННЫЕ АКТИВНЫЕ ПОЗИЦИИ (ИЗ ЖУРНАЛА СДЕЛОК):")
+        for ot in open_trades:
+            sr = ot.get("setup_reason")
+            sr_text = ""
+            if isinstance(sr, dict):
+                ai_str = f" | AI: {sr.get('ai_score')}/10" if sr.get('ai_score') is not None else ""
+                sr_text = f"\n      ↳ Сетап: {sr.get('bias_desc', '')} свип @ {sr.get('sweep_price', 0):.4f} (FVG: [{sr.get('fvg_bottom', 0):.4f} - {sr.get('fvg_top', 0):.4f}]){ai_str}"
+            print(f"   • {ot['symbol']} | {ot['direction']} {ot['amount']} | Вход: {ot['entry_price']:.4f} | SL: {ot['stop_loss']:.4f} | TP: {ot['take_profit']:.4f}{sr_text}")
+        print()
+
+    print("⚙️ 5. ПАРАМЕТРЫ СТРАТЕГИИ И ФИЛЬТРЫ:")
     print(f"   • Фильтр Asian Range:     {'ВКЛЮЧЕН (00:00-06:00 UTC, 62.6% WR, PF 2.34)' if args.asian_range else 'Выключен'}")
     print(f"   • Фильтр Killzones:       {'ВКЛЮЧЕН (07-10 & 12-15 UTC)' if args.killzones else 'Выключен (Круглосуточно)'}")
     print(f"   • ИИ-оценка сделок:       {'ВКЛЮЧЕНА (Google Gemini ' + cfg.GEMINI_MODEL + ')' if args.ai else 'Выключена'}")
@@ -673,7 +832,11 @@ def main():
     parser.add_argument("--aggressive", action="store_true", help="Агрессивный режим: риск 3.0%% от баланса на сделку")
     parser.add_argument("--max-pos", type=int, default=None, help="Максимум одновременно открытых позиций (по умолчанию: 1 при балансе < 50 USDT, иначе 3)")
     parser.add_argument("--leverage", type=int, default=None, help="Размер плеча (по умолчанию из config.py)")
+    parser.add_argument("--margin-mode", choices=["isolated", "cross"], default=getattr(cfg, "MARGIN_MODE", "isolated"), help="Режим маржи: isolated (изолированная, по умолчанию) или cross (кросс)")
     parser.add_argument("--poll-sec", type=int, default=cfg.POLL_INTERVAL_SEC, help="Интервал проверки рынка в секундах")
+    parser.add_argument("--alts", action="store_true", help="Торговать корзиной альтов без принудительного плеча (DOGE, ADA, XRP, BNB, SOL)")
+    parser.add_argument("--force-leverage", action="store_true", help="Разрешить торговлю парами с высоким минимальным контрактом (с принудительным плечом)")
+    parser.add_argument("-y", "--yes", action="store_true", help="Автоматическое подтверждение запуска на реальном счете")
     parser.add_argument("--stats", action="store_true", help="Показать детальную статистику сделок, комиссий и PnL и выйти")
     args = parser.parse_args()
 
@@ -695,18 +858,28 @@ def main():
     if args.symbol:
         sym = args.symbol if ":" in args.symbol else f"{args.symbol}:USDT"
         target_symbols = [sym]
+    elif args.alts:
+        target_symbols = list(cfg.SMALL_ACCOUNT_SYMBOLS)
     elif args.all:
         target_symbols = list(cfg.SWAP_SYMBOLS.values())
     else:
         target_symbols = [cfg.SWAP_SYMBOL]
 
     try:
-        exchange = init_exchange(demo_mode=demo_mode, leverage=args.leverage)
+        exchange = init_exchange(demo_mode=demo_mode, leverage=args.leverage, margin_mode=args.margin_mode, skip_confirm=args.yes)
     except RuntimeError:
         sys.exit(1)
 
     # Вывод полного стартового брифинга по балансу, расчету сделки и параметрам
     print_startup_briefing(exchange, args, target_symbols, risk_pct, demo_mode)
+
+    tg.notify_bot_started(
+        bot_name="Bitget USDT-M Futures",
+        mode="REAL ACCOUNT" if args.real else "DEMO TRADING",
+        symbols=target_symbols,
+        risk_pct=risk_pct,
+        max_pos=args.max_pos if args.max_pos else 3,
+    )
 
     seen = load_seen()
 
@@ -714,10 +887,30 @@ def main():
 
     while True:
         try:
-            now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            now_utc_dt = datetime.now(timezone.utc)
+            now_utc = now_utc_dt.strftime("%H:%M:%S")
 
             # 1. Проверяем открытые позиции и учитываем закрытия/комиссии
             reconcile_open_trades(exchange)
+
+            # Проверяем наличие открытых позиций
+            open_trades = [t for t in load_trades() if t.get("status") == "OPEN"]
+
+            # Если включен режим Киллзон и открытых позиций нет - умный сон до начала сессии
+            if args.killzones and len(open_trades) == 0:
+                diff_sec, kz_name, target_dt = get_next_killzone_delta(now_utc_dt, cfg.KILLZONES)
+                if diff_sec > 180:
+                    sleep_sec = diff_sec - 120  # просыпаемся за 2 минуты до старта
+                    target_str = target_dt.strftime("%H:%M UTC")
+                    mins_left = sleep_sec // 60
+                    print(f"\n💤 [Киллзоны] Вне торгового окна (следующая: {kz_name} в {target_str}).")
+                    print(f"   Открытых позиций нет. Бот переходит в спящий режим на {mins_left} мин. (до {target_str})...\n")
+
+                    wake_target = time.time() + sleep_sec
+                    while time.time() < wake_target:
+                        time.sleep(min(60, wake_target - time.time()))
+                    print(f"\n⏰ [Киллзоны] Пробуждение к началу {kz_name}! Начинаю сканирование...")
+                    continue
 
             # 2. Сканируем новые сетапы по парам
             for sym in target_symbols:

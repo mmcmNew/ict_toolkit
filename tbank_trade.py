@@ -28,6 +28,14 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import warnings
+try:
+    from deprecation import DeprecatedWarning
+    warnings.filterwarnings("ignore", category=DeprecatedWarning)
+except Exception:
+    pass
+warnings.filterwarnings("ignore", message=".*deprecated.*")
+
 import os
 import time
 import json
@@ -48,9 +56,11 @@ from data_sources import resolve_tbank_instrument
 from strategy import resample, compute_bias_series, bias_at, in_killzone
 from ict_advanced import compute_asian_ranges, is_asian_range_sweep
 from ai_evaluator import evaluate_setup
+import telegram_notifier as tg
 
 SEEN_SIGNALS_PATH = "tbank_seen_signals.json"
 TRADE_LOG_PATH = "tbank_trade_log.json"
+ACTIVE_POSITIONS_PATH = "tbank_active_positions.json"
 LOOKBACK_BARS_1M = 1000  # минутные свечи для построения 5m и 1h
 
 
@@ -90,22 +100,99 @@ def save_trades(trades):
         print(f"Предупреждение: не удалось сохранить trade log: {e}")
 
 
+def load_active_positions() -> dict:
+    """Загружает сохраненные открытые позиции из JSON-файла состояния."""
+    if os.path.exists(ACTIVE_POSITIONS_PATH):
+        try:
+            with open(ACTIVE_POSITIONS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ Предупреждение: не удалось прочитать активные позиции: {e}")
+            return {}
+    return {}
+
+
+def save_active_positions(positions: dict):
+    """Сохраняет текущие открытые позиции в JSON-файл для персистентности между перезапусками."""
+    try:
+        with open(ACTIVE_POSITIONS_PATH, "w", encoding="utf-8") as f:
+            json.dump(positions, f, indent=2, default=str)
+    except Exception as e:
+        print(f"⚠️ Предупреждение: не удалось сохранить активные позиции: {e}")
+
+
+def reconcile_positions_with_broker(client, account_id: str, active_positions: dict, meta_by_ticker: dict, sandbox: bool) -> dict:
+    """
+    Сверяет сохраненные активные позиции с реальным портфелем брокера.
+    Если позиция была закрыта вручную или отсутствует на счете, удаляет ее из активных.
+    """
+    if not active_positions:
+        return active_positions
+
+    try:
+        if sandbox:
+            pos_resp = client.sandbox.get_sandbox_positions(account_id=account_id)
+        else:
+            pos_resp = client.operations.get_positions(account_id=account_id)
+
+        # Карта FIGI -> количество акций в портфеле
+        broker_shares = {}
+        for s in pos_resp.securities:
+            broker_shares[s.figi] = s.balance
+
+        to_remove = []
+        for ticker, p in active_positions.items():
+            figi = meta_by_ticker.get(ticker, {}).get("figi")
+            if not figi:
+                continue
+            balance = broker_shares.get(figi, 0)
+            if balance <= 0:
+                print(f"  ℹ️ [{ticker}] Позиция отсутствует в портфеле брокера (баланс: {balance}). Снята с сопровождения.")
+                to_remove.append(ticker)
+            else:
+                print(f"  ✅ [{ticker}] Позиция подтверждена брокером: {balance} шт. в портфеле.")
+
+        for t in to_remove:
+            del active_positions[t]
+
+        if to_remove:
+            save_active_positions(active_positions)
+
+    except Exception as e:
+        print(f"  ⚠️ Не удалось сверить позиции с брокером: {e}. Используем сохраненное локальное состояние.")
+
+    return active_positions
+
+
 def show_stats():
     trades = load_trades()
+    active_pos = load_active_positions()
+
+    print("\n" + "=" * 85)
+    print("           📊 СТАТИСТИКА ТОРГОВЛИ: T-BANK INVEST API (МОСБИРЖА)")
+    print("=" * 85)
+
+    if active_pos:
+        print(f"📌 АКТИВНЫЕ ПОЗИЦИИ ({len(active_pos)}):")
+        for t, p in active_pos.items():
+            print(f"   • [{t}] {p.get('dir')} | {p.get('remaining_lots')}/{p.get('total_lots')} лот | Вход: {p.get('entry_price', 0):.2f} | SL: {p.get('current_stop', 0):.2f} | TP1: {p.get('tp1_price', 0):.2f}")
+            sr = p.get("setup_reason")
+            if sr:
+                ai_str = f" | AI: {sr.get('ai_score')}/10" if sr.get('ai_score') is not None else ""
+                print(f"     Причина входа: {sr.get('bias_desc', '')} свип @ {sr.get('sweep_price', 0):.2f} (FVG: [{sr.get('fvg_bottom', 0):.2f} - {sr.get('fvg_top', 0):.2f}]){ai_str}")
+        print("-" * 85)
+    else:
+        print("Активных открытых позиций нет.")
+        print("-" * 85)
+
     if not trades:
-        print("\nПока нет зарегистрированных сделок в Т-Банке.")
+        print("Закрытых сделок пока нет.")
+        print("=" * 85 + "\n")
         return
 
     df = pd.DataFrame(trades)
-    print("\n" + "=" * 85)
-    print(f"СТАТИСТИКА ТОРГОВЛИ В Т-БАНКЕ (Всего записей: {len(df)})")
-    print("=" * 85)
-
     closed = df[df["status"] == "CLOSED"]
-    open_pos = df[df["status"] == "OPEN"]
-
-    print(f"Активных позиций: {len(open_pos)}")
-    print(f"Закрытых сделок: {len(closed)}")
+    print(f"Всего закрытых сделок: {len(closed)}")
 
     if len(closed) > 0:
         net_r_total = closed["net_r"].sum() if "net_r" in closed.columns else 0.0
@@ -136,7 +223,11 @@ def show_stats():
                 r.get("net_r", 0.0),
                 r.get("net_pnl_rub", 0.0)
             ))
-    print("=" * 85)
+            sr = r.get("setup_reason")
+            if isinstance(sr, dict):
+                ai_str = f" | AI: {sr.get('ai_score')}/10" if sr.get('ai_score') is not None else ""
+                print(f"   ↳ Сетап: {sr.get('bias_desc', '')} свип @ {sr.get('sweep_price', 0):.2f} | FVG: [{sr.get('fvg_bottom', 0):.2f}-{sr.get('fvg_top', 0):.2f}]{ai_str}")
+    print("=" * 85 + "\n")
 
 
 def get_account_rub_balance(client, account_id: str, sandbox: bool) -> float:
@@ -157,23 +248,66 @@ def get_account_rub_balance(client, account_id: str, sandbox: bool) -> float:
     return 100_000.0  # запасное значение для расчетов
 
 
-def is_market_open(client, figi: str) -> bool:
-    """Проверяет доступность биржевых торгов по инструменту на Мосбирже."""
+def is_market_open(client=None, figi: str = "") -> bool:
+    """
+    Проверяет доступность биржевых торгов на Мосбирже (по времени МСК и расписанию торговых сессий).
+    - Пн-Пт: Основная сессия 10:00 - 18:40 МСК, Вечерняя сессия 19:05 - 23:50 МСК
+    - Выходные: закрыто
+    """
     try:
-        from t_tech.invest.schemas import SecurityTradingStatus
-        status_resp = client.market_data.get_trading_status(instrument_id=figi)
-        st = status_resp.trading_status
-        # NORMAL_TRADING означает обычные безадресные торги
-        if st in (
-            SecurityTradingStatus.SECURITY_TRADING_STATUS_NORMAL_TRADING,
-            SecurityTradingStatus.SECURITY_TRADING_STATUS_SESSION_OPEN,
-        ):
+        now_msk = datetime.now(timezone(timedelta(hours=3)))
+        if now_msk.weekday() >= 5:  # Суббота (5) и Воскресенье (6)
+            return False
+        t_min = now_msk.hour * 60 + now_msk.minute
+        # Основная сессия: 10:00 (600 мин) - 18:40 (1120 мин)
+        # Вечерняя сессия: 19:05 (1145 мин) - 23:50 (1430 мин)
+        if (600 <= t_min <= 1120) or (1145 <= t_min <= 1430):
             return True
-        # Если статус закрыт, аукцион или клиринг
         return False
     except Exception:
-        # Если сервис временно не отдал статус, разрешаем для песочницы/paper
         return True
+
+
+def get_moex_sleep_duration() -> tuple[int, str]:
+    """
+    Рассчитывает время сна до следующего открытия Мосбиржи (МСК).
+    - Пн-Пт Основная сессия: 10:00 - 18:40 МСК
+    - Пн-Пт Вечерняя сессия: 19:05 - 23:50 МСК
+    - Выходные: закрыто до понедельника 10:00 МСК
+    """
+    now_msk = datetime.now(timezone(timedelta(hours=3)))
+    weekday = now_msk.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+    t_min = now_msk.hour * 60 + now_msk.minute
+
+    # 1. Если выходные (суббота или воскресенье)
+    if weekday == 5:  # Суббота
+        days_ahead = 2
+        target = now_msk.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+        desc = "Понедельник 10:00 МСК"
+    elif weekday == 6:  # Воскресенье
+        days_ahead = 1
+        target = now_msk.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+        desc = "Понедельник 10:00 МСК"
+    # 2. Пятница после вечерней сессии (23:50)
+    elif weekday == 4 and t_min > 1430:
+        days_ahead = 3
+        target = now_msk.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+        desc = "Понедельник 10:00 МСК"
+    # 3. Будни до 10:00 МСК
+    elif t_min < 600:
+        target = now_msk.replace(hour=10, minute=0, second=0, microsecond=0)
+        desc = f"сегодня {target.strftime('%H:%M')} МСК"
+    # 4. Будни перерыв между сессиями (18:40 - 19:05 МСК)
+    elif 1120 < t_min < 1145:
+        target = now_msk.replace(hour=19, minute=5, second=0, microsecond=0)
+        desc = f"сегодня {target.strftime('%H:%M')} МСК (Вечерняя сессия)"
+    # 5. Будни после 23:50 МСК (ночь)
+    else:
+        target = now_msk.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        desc = f"завтра 10:00 МСК"
+
+    diff_sec = int((target - now_msk).total_seconds())
+    return max(60, diff_sec), desc
 
 
 def fetch_recent_candles(client, figi: str, interval, lookback_bars: int = 1000) -> pd.DataFrame:
@@ -275,7 +409,7 @@ def place_order(client, account_id: str, figi: str, direction_str: str,
 
 def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                   risk_pct: float, use_ai: bool, use_asian: bool, use_kz: bool,
-                  poll_sec: int):
+                  poll_sec: int, max_pos: int = 5):
     from t_tech.invest import Client, CandleInterval
     from t_tech.invest.constants import INVEST_GRPC_API, INVEST_GRPC_API_SANDBOX
 
@@ -290,6 +424,7 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
     print(f"Режим работы:           {mode_str}")
     print(f"Корзина тикеров ({len(tickers)}):   {', '.join(tickers)}")
     print(f"Риск на сделку:         {risk_pct:.1f}% от баланса депозита")
+    print(f"Лимит позиций:          до {max_pos} одновременных сделок")
     print(f"Фильтр Asian Range:     {'ВКЛЮЧЕН' if use_asian else 'ВЫКЛЮЧЕН'}")
     print(f"Фильтр Киллзон (MOEX):  {'ВКЛЮЧЕН (10:00-14:00, 16:30-18:40 МСК)' if use_kz else 'ВЫКЛЮЧЕН'}")
     print(f"Google Gemini ИИ-оценка:{'ВКЛЮЧЕНА' if use_ai else 'ВЫКЛЮЧЕНА'}")
@@ -297,7 +432,16 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
     print("=" * 80)
 
     seen_signals = load_seen()
-    active_positions = {}  # ticker -> position state dict
+    active_positions = load_active_positions()
+    if active_positions:
+        print(f"\n🔄 Восстановлено активных позиций из файла состояния ({len(active_positions)}):")
+        for t_saved, p_saved in active_positions.items():
+            print(f"   • [{t_saved}] {p_saved.get('dir')} | {p_saved.get('remaining_lots')}/{p_saved.get('total_lots')} лот | Вход: {p_saved.get('entry_price', 0):.2f} | SL: {p_saved.get('current_stop', 0):.2f} | TP1: {p_saved.get('tp1_price', 0):.2f}")
+            sr = p_saved.get("setup_reason")
+            if sr:
+                ai_str = f" | AI: {sr.get('ai_score')}/10" if sr.get('ai_score') is not None else ""
+                print(f"     Причина входа: {sr.get('bias_desc', '')} свип @ {sr.get('sweep_price', 0):.2f} (FVG: [{sr.get('fvg_bottom', 0):.2f} - {sr.get('fvg_top', 0):.2f}]){ai_str}")
+        print()
 
     with Client(token, target=target) as client:
         # Определение рабочего счета
@@ -326,10 +470,22 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
             meta_by_ticker[t] = meta
             print(f"  • {t:<6} -> {meta['name']} | FIGI: {meta['figi']} | 1 лот = {meta['lot']} шт.")
 
+        # Сверка активных позиций с реальным портфелем брокера
+        if not paper:
+            active_positions = reconcile_positions_with_broker(client, account_id, active_positions, meta_by_ticker, sandbox)
+
         # Предполетная проверка баланса
         init_balance = get_account_rub_balance(client, account_id, sandbox)
         print(f"\nТекущий свободный баланс: {init_balance:,.2f} RUB")
         print("Начинаю мониторинг рынка...\n")
+
+        tg.notify_bot_started(
+            bot_name="T-Bank Invest API (Мосбиржа)",
+            mode=mode_str,
+            symbols=tickers,
+            risk_pct=risk_pct,
+            max_pos=max_pos,
+        )
 
         try:
             iteration = 0
@@ -337,7 +493,7 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                 iteration += 1
                 now_utc = datetime.now(timezone.utc)
                 now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-                print(f"[{now_str}] Итерация #{iteration} | Позиций открыто: {len(active_positions)}/{cfg.TBANK_MAX_POSITIONS}")
+                print(f"[{now_str}] Итерация #{iteration} | Позиций открыто: {len(active_positions)}/{max_pos}")
 
                 # 1. Сопровождение открытых позиций
                 for t, pos in list(active_positions.items()):
@@ -378,12 +534,24 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                                 "exit_reason": "STOP_LOSS",
                                 "net_r": round(net_r, 2),
                                 "net_pnl_rub": round(pnl_rub, 2),
-                                "time": str(now_utc)
+                                "time": str(now_utc),
+                                "setup_reason": pos.get("setup_reason")
                             }
                             trades = load_trades()
                             trades.append(record)
                             save_trades(trades)
                             del active_positions[t]
+                            save_active_positions(active_positions)
+                            tg.notify_trade_closed(
+                                market="T-Bank MOEX",
+                                symbol=t,
+                                direction="LONG",
+                                exit_price=curr_price,
+                                exit_reason="STOP_LOSS",
+                                net_pnl=pnl_rub,
+                                currency="RUB",
+                                net_r=net_r,
+                            )
                             continue
 
                         # Частичный тейк 1.5R (50%)
@@ -393,19 +561,45 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                             place_order(client, account_id, inst["figi"], "SHORT", take_lots, sandbox, paper)
                             pos["partial_taken"] = True
                             pos["remaining_lots"] -= take_lots
-                            # Перенос стопа в безубыток
-                            pos["current_stop"] = entry_p + (entry_p * 0.0005)
-                            print(f"  🛡️ [{t}] Стоп перенесён в безубыток: {pos['current_stop']:.2f}")
+                            # Перенос стопа в безубыток с учетом комиссий брокера и биржи (True BE)
+                            be_buffer = entry_p * (cfg.TBANK_COMMISSION_PCT * 2.2)
+                            pos["current_stop"] = entry_p + be_buffer
+                            print(f"  🛡️ [{t}] Стоп перенесён в безубыток (+комиссии): {pos['current_stop']:.2f}")
+                            save_active_positions(active_positions)
+                            tg.notify_partial_take(
+                                market="T-Bank MOEX",
+                                symbol=t,
+                                direction="LONG",
+                                fill_price=curr_price,
+                                closed_str=f"{take_lots} лот ({take_lots * inst['lot']} шт.)",
+                                remaining_str=f"{pos['remaining_lots']} лот ({pos['remaining_lots'] * inst['lot']} шт.)",
+                                be_stop=pos["current_stop"],
+                            )
 
                         # Трейлинг остатка
                         if pos["partial_taken"]:
                             new_trail = curr_price - (0.8 * r_unit)
                             if new_trail > pos["current_stop"]:
                                 pos["current_stop"] = new_trail
+                                save_active_positions(active_positions)
 
-                # 2. Поиск новых входов по корзине
-                if len(active_positions) >= getattr(cfg, "TBANK_MAX_POSITIONS", 1):
-                    print(f"  ℹ️ Лимит открытых позиций ({cfg.TBANK_MAX_POSITIONS}) достигнут. Ожидание сопровождения...")
+                # 2. Проверка биржевого расписания Мосбиржи (Smart Sleep)
+                if not paper and not is_market_open(client):
+                    if len(active_positions) == 0:
+                        sleep_sec, open_desc = get_moex_sleep_duration()
+                        mins_left = sleep_sec // 60
+                        print(f"\n🌙 [MOEX] Торги закрыты (открытие: {open_desc}).")
+                        print(f"   Открытых позиций нет. Бот переходит в спящий режим на {mins_left} мин. (до {open_desc})...\n")
+
+                        wake_target = time.time() + sleep_sec - 120
+                        while time.time() < wake_target:
+                            time.sleep(min(60, wake_target - time.time()))
+                        print(f"\n⏰ [MOEX] Пробуждение к открытию торгов ({open_desc})! Начинаю сканирование...")
+                        continue
+
+                # 3. Поиск новых входов по корзине
+                if len(active_positions) >= max_pos:
+                    print(f"  ℹ️ Лимит открытых позиций ({max_pos}) достигнут. Ожидание сопровождения...")
                     time.sleep(poll_sec)
                     continue
 
@@ -526,7 +720,24 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                         total_trade_cost = lots * inst["lot"] * fill_price
 
                     if total_trade_cost > curr_balance:
-                        print(f"  ⚠️ Недостаточно средств для покупки даже 1 лота {t} (требуется {total_trade_cost:.2f} RUB, доступно {curr_balance:.2f} RUB)")
+                        req_rub = inst["lot"] * fill_price
+                        print(f"\n⚠️ [{t}] СИГНАЛ ПРОПУЩЕН: НЕ ХВАТАЕТ РУБЛЕЙ НА СЧЁТЕ!")
+                        print(f"   Сетап:            {direction} по {fill_price:.2f} RUB")
+                        print(f"   Требуется на 1 лот ({inst['lot']} шт.): {req_rub:.2f} RUB")
+                        print(f"   Доступно на счете: {curr_balance:.2f} RUB")
+                        print(f"   💡 Подсказка:     Пополните счет на {(req_rub - curr_balance):.2f}+ RUB или закройте позицию для входа.\n")
+                        tg.notify_margin_warning(
+                            market="T-Bank MOEX",
+                            symbol=t,
+                            direction=direction,
+                            price=fill_price,
+                            required_amount=req_rub,
+                            available_amount=curr_balance,
+                            currency="RUB",
+                            hint=f"Пополните счет на {(req_rub - curr_balance):.2f}+ RUB или закройте позицию для входа.",
+                        )
+                        seen_signals.add(sig_id)
+                        save_seen(seen_signals)
                         continue
 
                     # Вход в сделку!
@@ -540,7 +751,24 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
 
                     order_res = place_order(client, account_id, figi, direction, lots, sandbox, paper)
                     if order_res:
-                        tp1_target = fill_price + 1.5 * risk_distance if direction == "LONG" else fill_price - 1.5 * risk_distance
+                        fee_buffer = fill_price * (cfg.TBANK_COMMISSION_PCT * 2)
+                        tp1_target = fill_price + (1.5 * risk_distance) + fee_buffer if direction == "LONG" else fill_price - (1.5 * risk_distance) - fee_buffer
+                        setup_reason = {
+                            "bias": curr_bias,
+                            "bias_desc": "BULLISH" if curr_bias == 1 else "BEARISH",
+                            "sweep_time": str(last_sweep_time),
+                            "sweep_price": float(sweep_candle["low"] if direction == "LONG" else sweep_candle["high"]),
+                            "sweep_dir": sweep_dir,
+                            "fvg_bottom": float(best_fvg["Bottom"]),
+                            "fvg_top": float(best_fvg["Top"]),
+                            "fvg_time": str(fvg_time),
+                            "risk_distance": float(risk_distance),
+                            "risk_distance_pct": round(float(risk_distance / fill_price) * 100, 2),
+                            "asian_range_sweep": bool(use_asian),
+                            "in_killzone": bool(use_kz),
+                            "ai_score": ai_score if use_ai else None,
+                            "ai_reason": ai_reason if use_ai else None,
+                        }
                         active_positions[t] = {
                             "ticker": t,
                             "dir": direction,
@@ -551,10 +779,23 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                             "total_lots": lots,
                             "remaining_lots": lots,
                             "partial_taken": False,
-                            "open_time": str(now_utc)
+                            "open_time": str(now_utc),
+                            "setup_reason": setup_reason
                         }
+                        save_active_positions(active_positions)
                         seen_signals.add(sig_id)
                         save_seen(seen_signals)
+                        tg.notify_trade_opened(
+                            market="T-Bank MOEX",
+                            symbol=t,
+                            direction=direction,
+                            entry_price=fill_price,
+                            stop_loss=stop_loss,
+                            take_profit=tp1_target,
+                            amount_str=f"{lots} лот ({lots * inst['lot']} шт.) ~{total_trade_cost:,.2f} RUB",
+                            risk_str=f"{risk_pct:.1f}% (~{risk_amount_rub:,.2f} RUB)",
+                            setup_reason=setup_reason,
+                        )
 
                 time.sleep(poll_sec)
 
@@ -575,7 +816,9 @@ def main():
     parser.add_argument("--ai", action="store_true", help="Включить Gemini ИИ-оценку сетапов")
     parser.add_argument("--asian-range", action="store_true", help="Фильтр азиатской сессии")
     parser.add_argument("--killzones", action="store_true", help="Фильтр торговых часов")
+    parser.add_argument("--max-pos", type=int, default=getattr(cfg, "TBANK_MAX_POSITIONS", 5), help="Максимум одновременно открытых позиций (по умолчанию 5)")
     parser.add_argument("--poll", type=int, default=60, help="Периодичность проверки рынка в секундах (по умолчанию 60)")
+    parser.add_argument("-y", "--yes", action="store_true", help="Автоматическое подтверждение запуска на реальном счете")
     parser.add_argument("--stats", action="store_true", help="Вывести статистику истории сделок и выйти")
 
     args = parser.parse_args()
@@ -595,10 +838,13 @@ def main():
         print("ВНИМАНИЕ: Вы выбрали запуск на РЕАЛЬНОМ брокерском счёте Т-Банка!")
         print("Сделки будут выводиться на Мосбиржу на РЕАЛЬНЫЕ ДЕНЬГИ.")
         print("!" * 75)
-        confirm = input("Для подтверждения запуска введите 'ДА': ")
-        if confirm.strip() != "ДА":
-            print("Запуск отменён.")
-            return
+        if not args.yes:
+            confirm = input("Для подтверждения запуска введите 'ДА': ")
+            if confirm.strip() != "ДА":
+                print("Запуск отменён.")
+                return
+        else:
+            print("✅ Запуск на реальном счете подтвержден флагом --yes.")
     elif args.sandbox:
         paper = False
         sandbox = True
@@ -638,7 +884,8 @@ def main():
         use_ai=args.ai or getattr(cfg, "ENABLE_AI_EVALUATION", False),
         use_asian=args.asian_range or getattr(cfg, "USE_ASIAN_RANGE_FILTER", False),
         use_kz=args.killzones or getattr(cfg, "USE_KILLZONES", False),
-        poll_sec=args.poll
+        poll_sec=args.poll,
+        max_pos=args.max_pos
     )
 
 

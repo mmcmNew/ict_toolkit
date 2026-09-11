@@ -20,6 +20,14 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import warnings
+try:
+    from deprecation import DeprecatedWarning
+    warnings.filterwarnings("ignore", category=DeprecatedWarning)
+except Exception:
+    pass
+warnings.filterwarnings("ignore", message=".*deprecated.*")
+
 import os
 import argparse
 from datetime import timedelta

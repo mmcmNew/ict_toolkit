@@ -26,8 +26,10 @@ dashboard*.html
 *.log
 live_seen_signals.json
 tbank_seen_signals.json
+tbank_active_positions.json
 live_trade_log.json
 tbank_trade_log.json
+isolate_diff.txt
 
 # Временные архивы
 *.zip

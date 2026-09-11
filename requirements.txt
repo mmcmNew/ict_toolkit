@@ -5,3 +5,4 @@ ccxt>=4.0
 python-dotenv>=1.0
 plotly>=5.18
 google-genai>=2.0.0
+t-tech-investments>=1.49.0

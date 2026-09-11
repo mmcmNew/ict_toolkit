@@ -48,7 +48,45 @@ def bias_at(bias_series: pd.Series, ts) -> int:
 
 def in_killzone(ts, killzones) -> bool:
     h = ts.hour
-    return any(a <= h < b for a, b in killzones)
+    for a, b in killzones:
+        if a <= b:
+            if a <= h < b:
+                return True
+        else:
+            if h >= a or h < b:
+                return True
+    return False
+
+
+def get_next_killzone_delta(now_utc, killzones):
+    """
+    Возвращает (seconds_until_start, session_name, target_dt) до следующей Киллзоны.
+    Если сейчас внутри Киллзоны, возвращает (0, "INSIDE_KILLZONE", now_utc).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    if in_killzone(now_utc, killzones):
+        return 0, "INSIDE_KILLZONE", now_utc
+
+    kz_names = {
+        (7, 10): "London Killzone (07:00-10:00 UTC)",
+        (12, 15): "New York Killzone (12:00-15:00 UTC)",
+    }
+
+    candidates = []
+    for day_offset in (0, 1):
+        target_date = (now_utc + timedelta(days=day_offset)).date()
+        for start_h, end_h in killzones:
+            start_dt = datetime(target_date.year, target_date.month, target_date.day, start_h, 0, 0, tzinfo=timezone.utc)
+            if start_dt > now_utc:
+                diff_sec = int((start_dt - now_utc).total_seconds())
+                name = kz_names.get((start_h, end_h), f"Killzone {start_h:02d}:00-{end_h:02d}:00 UTC")
+                candidates.append((diff_sec, name, start_dt))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0]
+    return 3600, "Unknown Killzone", now_utc + timedelta(hours=1)
 
 
 def find_candidates(df_htf, df_ltf, cfg, df_1m=None, smt_df=None):
@@ -56,6 +94,7 @@ def find_candidates(df_htf, df_ltf, cfg, df_1m=None, smt_df=None):
     Возвращает список кандидатов на сделку: HTF bias + LTF sweep + LTF FVG confluence.
     Поддерживает фильтры:
     - Killzones (USE_KILLZONES)
+    - Направление (DIRECTION_FILTER: 'all', 'long', 'short')
     - Asian Range High/Low sweep (USE_ASIAN_RANGE_FILTER)
     - SMT Divergence (USE_SMT_FILTER)
     """
@@ -92,6 +131,12 @@ def find_candidates(df_htf, df_ltf, cfg, df_1m=None, smt_df=None):
             continue
         expected_dir = 1 if row["Liquidity"] == -1 else -1
         if expected_dir != bias:
+            continue
+
+        dir_filter = getattr(cfg, "DIRECTION_FILTER", "all")
+        if dir_filter in ("long", "LONG") and expected_dir != 1:
+            continue
+        if dir_filter in ("short", "SHORT") and expected_dir != -1:
             continue
 
         sweep_candle = df_ltf.iloc[swept_bar_idx]
