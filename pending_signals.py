@@ -188,3 +188,19 @@ def clean_stale_signals(ttl_sec: int = 600):
             changed = True
     if changed:
         save_pending_signals(signals)
+
+
+def has_pending_signals(market: str = None) -> bool:
+    """Возвращает True, если есть сигналы, ожидающие решения пользователя (PENDING) или одобренные (APPROVED)."""
+    signals = load_pending_signals()
+    now = time.time()
+    for s in signals.values():
+        st = s.get("status")
+        if st == "PENDING" and (now - s.get("created_ts", now) < 600):
+            if market is None or market.lower() in s.get("market", "").lower():
+                return True
+        elif st == "APPROVED" and (now - s.get("approved_ts", now) < 180):
+            if market is None or market.lower() in s.get("market", "").lower():
+                return True
+    return False
+

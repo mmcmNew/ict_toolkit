@@ -215,9 +215,7 @@ def update_active_symbols(market: str, symbols: list[str]) -> bool:
 
     if market.lower() == "crypto":
         ALTS_SYMBOLS = clean_syms
-        SMALL_ACCOUNT_SYMBOLS = [
-    "XRP/USDT:USDT"
-]
+        SMALL_ACCOUNT_SYMBOLS = [f"{s}:USDT" if not s.endswith(":USDT") else s for s in clean_syms]
         for s in clean_syms:
             base = s.split(":")[0]
             SWAP_SYMBOLS[base] = f"{base}:USDT"
@@ -266,9 +264,7 @@ if os.path.exists(ACTIVE_UNIVERSE_FILE):
             _universe = _json.load(_f)
             if "crypto" in _universe and _universe["crypto"]:
                 ALTS_SYMBOLS = _universe["crypto"]
-                SMALL_ACCOUNT_SYMBOLS = [
-    "XRP/USDT:USDT"
-]
+                SMALL_ACCOUNT_SYMBOLS = [f"{_s}:USDT" if not _s.endswith(":USDT") else _s for _s in ALTS_SYMBOLS]
                 for _s in ALTS_SYMBOLS:
                     _base = _s.split(":")[0]
                     SWAP_SYMBOLS[_base] = f"{_base}:USDT"

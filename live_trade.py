@@ -1422,6 +1422,7 @@ def main():
     last_5m_checked_bucket = None
     last_1m_checked_bucket = None
     last_in_trade_check_time = 0.0
+    last_status_log_time = 0.0
 
     print("📡 Иерархический Event-Driven мониторинг запущен:")
     print("   • Фаза 1 (IDLE): Дозор на закрытии 5m свечей (:00, :05, :10...)")
@@ -1535,17 +1536,26 @@ def main():
 
             if is_initial_start or (is_5m_candle_close and last_5m_checked_bucket != now_5m_bucket):
                 last_5m_checked_bucket = now_5m_bucket
+                scan_reason = "Первый старт" if is_initial_start else "Закрытие 5m свечи"
+                print(f"\n[{now_utc} UTC] ⏱️ {scan_reason}. Сканирование {len(target_symbols)} пар на 5m свипы ликвидности...")
                 scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states)
+                last_status_log_time = now_epoch
 
             save_seen(seen)
 
             # Расчет секунд до следующей 5-минутной свечи
             sec_into_5m = (now_utc_dt.minute % 5) * 60 + now_utc_dt.second
-            sec_to_5m = max(0, 300 - sec_into_5m)
-            status_armed = f" | 🎯 Взведено: {len(armed_symbols)}" if armed_symbols else ""
-            status_pos = f" | 💼 Позиций: {len(open_trades)}" if open_trades else ""
-            sys.stdout.write(f"\r[{now_utc} UTC] Мониторинг {len(target_symbols)} пар (Риск {risk_pct:.1f}%){status_pos}{status_armed} | До 5m скана: {sec_to_5m}с   ")
-            sys.stdout.flush()
+            sec_to_5m = (302 - sec_into_5m) % 300
+            if sec_to_5m == 0:
+                sec_to_5m = 300
+
+            # Дискретный периодический лог (не чаще одного раза в poll_sec, например раз в 30 сек)
+            poll_interval = getattr(args, "poll_sec", 30) or 30
+            if now_epoch - last_status_log_time >= poll_interval:
+                last_status_log_time = now_epoch
+                status_armed = f" | 🎯 Взведено: {len(armed_symbols)}" if armed_symbols else ""
+                status_pos = f" | 💼 Позиций: {len(open_trades)}" if open_trades else ""
+                print(f"[{now_utc} UTC] Мониторинг {len(target_symbols)} пар (Риск {risk_pct:.1f}%){status_pos}{status_armed} | До 5m закрытия: {sec_to_5m}с")
 
         except KeyboardInterrupt:
             print("\n🛑 Бот остановлен пользователем.")
@@ -1554,9 +1564,26 @@ def main():
             print(f"\n⚠️ Ошибка в цикле: {e} - повтор через 5 секунд")
             time.sleep(5)
 
-        # Реактивный сон: проверяем Telegram-подтверждения каждую секунду
-        for _ in range(1):
-            if ps.get_approved_signals(market="bitget"):
+        # Адаптивный интервал сна:
+        # 1. Если есть сигналы на одобрение в TG -> спим 2 сек для моментальной реакции
+        # 2. Если есть открытая позиция (IN_TRADE) -> опрашиваем тикер каждые 5 сек
+        # 3. Если есть взведенные пары (ARMED) -> ждем закрытия 1m свечи (до :02 сек следующей минуты)
+        # 4. Если в режиме ожидания (IDLE) -> ждем закрытия 5m свечи или интервал poll_sec (30 сек)
+        if ps.has_pending_signals(market="bitget"):
+            sleep_target = 2
+        elif open_trades:
+            sleep_target = 5
+        elif armed_symbols:
+            sec_to_1m = (62 - now_utc_dt.second) % 60
+            if sec_to_1m == 0:
+                sec_to_1m = 60
+            sleep_target = min(10, max(2, sec_to_1m))
+        else:
+            sleep_target = min(poll_interval, max(5, sec_to_5m))
+
+        # Спим заданное время с проверкой прерывания при появлении сигнала из TG
+        for _ in range(sleep_target):
+            if ps.has_pending_signals(market="bitget"):
                 break
             time.sleep(1)
 
