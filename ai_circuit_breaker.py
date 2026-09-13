@@ -84,7 +84,7 @@ def evaluate_circuit_breaker_ai(symbol: str, consecutive_losses: int, df_1h: pd.
     Запрашивает у Gemini анализ рыночного режима при серии убытков.
     """
     api_key = getattr(cfg, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
-    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-3.6-flash")
+    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-3.5-flash")
 
     # Сводка недавних свечей 1H
     recent_info = "N/A"
@@ -336,7 +336,7 @@ def evaluate_pre_trading_universe_ai(symbols: list[str], exchange=None, market: 
 
     # Формируем сводный промпт для Gemini
     api_key = getattr(cfg, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
-    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-3.6-flash")
+    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-3.5-flash")
 
     verdicts = {}
     used_ai = False
@@ -830,7 +830,7 @@ def evaluate_portfolio_and_positions_ai(exchange=None, send_tg: bool = False) ->
     basket_data = get_active_basket_data(exchange=exchange)
 
     api_key = getattr(cfg, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
-    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-3.6-flash")
+    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-3.5-flash")
 
     pos_summary = []
     for p in open_positions:
@@ -922,7 +922,7 @@ def evaluate_portfolio_and_positions_ai(exchange=None, send_tg: bool = False) ->
   }}
 }}
 """
-            models_to_try = [model_name, "gemini-3.5-flash", "gemini-flash-latest"]
+            models_to_try = ["gemini-3.5-flash", "gemini-flash-latest"]
             for m_name in models_to_try:
                 try:
                     resp = client.models.generate_content(

@@ -389,27 +389,47 @@ def get_ai_portfolio_report_and_keyboard() -> tuple[str, dict]:
 
 def handle_command(text: str) -> tuple[str, dict]:
     """Обрабатывает входящую текстовую команду и возвращает ответ с кнопками."""
-    cmd = text.strip().lower()
     keyboard = get_main_keyboard()
+    clean_text = "".join(ch for ch in text if ch.isalnum() or ch in " /-_").strip().lower()
 
-    if cmd in ("/start", "/help", "помощь", "❓ помощь", "help"):
+    if any(k in clean_text for k in ("помощ", "help", "start")):
         return format_help_message(), keyboard
-    elif cmd in ("/screen", "/screener", "скринер", "🔍 скринер", "screen"):
+    elif any(k in clean_text for k in ("скрин", "screen")):
+        if "moex" in clean_text or "мосбирж" in clean_text:
+            return get_screener_report_or_menu("moex")
         return get_screener_report_or_menu("crypto")
-    elif cmd in ("/screen_crypto", "screen crypto"):
-        return get_screener_report_or_menu("crypto")
-    elif cmd in ("/screen_moex", "screen moex"):
-        return get_screener_report_or_menu("moex")
-    elif cmd in ("/ai", "/ai_portfolio", "/ai_positions", "/ai_review", "/audit",
-                 "ии", "🧠 ии-анализ", "🧠 ии-оценка", "ии-анализ", "ии анализ", "ии портфель", "ai", "портфель", "оценка"):
-        return get_ai_portfolio_report_and_keyboard()
-    elif cmd in ("/stats", "статистика", "📊 статистика", "stats"):
+    elif any(k in clean_text for k in ("ии", "ai", "анализ", "audit", "портфел", "оценк")):
+        def _run_ai_audit_async():
+            try:
+                from ai_circuit_breaker import evaluate_portfolio_and_positions_ai
+                report_text, _ = evaluate_portfolio_and_positions_ai(send_tg=False)
+                kb = {
+                    "inline_keyboard": [
+                        [{"text": "🔄 Обновить ИИ-Анализ", "callback_data": "ai:refresh"}],
+                        [
+                            {"text": "📌 Открытые позиции", "callback_data": "pos:view"},
+                            {"text": "🔍 Скринер", "callback_data": "screen:run:crypto"},
+                        ],
+                    ]
+                }
+                send_bot_reply(report_text, reply_markup=kb)
+            except Exception as e:
+                send_bot_reply(f"⚠️ Ошибка выполнения ИИ-аудита: {html.escape(str(e))}", reply_markup=keyboard)
+
+        threading.Thread(target=_run_ai_audit_async, daemon=True).start()
+        return (
+            "⏳ <b>ЗАПУЩЕН ИИ-АУДИТ ПОРТФЕЛЯ И КОРЗИНЫ...</b>\n\n"
+            "<i>Нейросеть Google Gemini и квант-модуль анализируют открытые позиции и рынок.\n"
+            "Сводка поступит через ~3-5 секунд...</i>",
+            keyboard,
+        )
+    elif any(k in clean_text for k in ("статистик", "stat")):
         return format_stats_report(), keyboard
-    elif cmd in ("/positions", "позиции", "📌 позиции", "pos"):
+    elif any(k in clean_text for k in ("позици", "pos")):
         return format_positions_report(), keyboard
-    elif cmd in ("/balance", "баланс", "💰 баланс", "bal"):
+    elif any(k in clean_text for k in ("баланс", "bal")):
         return format_balance_report(), keyboard
-    elif cmd in ("/status", "статус", "🕒 статус сессий", "status"):
+    elif any(k in clean_text for k in ("статус", "сесси", "status")):
         return format_status_report(), keyboard
     else:
         return (

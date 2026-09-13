@@ -59,7 +59,7 @@ ACTIVE_UNIVERSE_FILE = os.path.join(DATA_DIR, "active_universe.json")
 # --- Google Gemini AI / Анализ и оценка сделок ---
 import os as _os
 GEMINI_API_KEY = _os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = _os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")  # актуальная быстрая модель
+GEMINI_MODEL = _os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")  # стабильная быстрая модель
 ENABLE_AI_EVALUATION = False       # включить оценку перед входом в сделку (или через флаг --ai)
 AI_CONFIDENCE_THRESHOLD = 7        # минимальный балл (1-10) для одобрения сделки ИИ
 
