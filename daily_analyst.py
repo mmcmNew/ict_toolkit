@@ -36,6 +36,24 @@ from strategy import resample, compute_bias_series, bias_at, in_killzone
 from smartmoneyconcepts import smc
 
 
+def resolve_backtest_results_path(slug: str, symbol: str = None) -> str:
+    """Ищет файл backtest_results в reports/ с фоллбэком на корень проекта."""
+    reports_dir = getattr(cfg, "REPORTS_DIR", "reports")
+    candidates = [
+        os.path.join(reports_dir, f"backtest_results_{slug}.csv"),
+        f"backtest_results_{slug}.csv",
+    ]
+    if symbol is None or symbol == getattr(cfg, "SYMBOL", "BTC/USDT"):
+        candidates.extend([
+            os.path.join(reports_dir, "backtest_results.csv"),
+            "backtest_results.csv",
+        ])
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return os.path.join(reports_dir, f"backtest_results_{slug}.csv")
+
+
 def find_missed_opportunities(df_1m: pd.DataFrame, df_htf: pd.DataFrame,
                               df_ltf: pd.DataFrame, target_date_str: str,
                               symbol: str) -> list:
@@ -265,9 +283,7 @@ def analyze_day(target_date_str: str, symbol: str = "BTC/USDT") -> tuple[dict, s
     }
 
     # Загрузка сделок за день
-    trades_path = f"backtest_results_{slug}.csv"
-    if not os.path.exists(trades_path) and symbol == getattr(cfg, "SYMBOL", "BTC/USDT"):
-        trades_path = "backtest_results.csv"
+    trades_path = resolve_backtest_results_path(slug, symbol)
 
     trades_today = []
     if os.path.exists(trades_path):
@@ -377,9 +393,7 @@ def main():
     target_date = args.date
     if not target_date or args.latest:
         # Пытаемся найти дату из сделок
-        trades_path = f"backtest_results_{slug}.csv"
-        if not os.path.exists(trades_path):
-            trades_path = "backtest_results.csv"
+        trades_path = resolve_backtest_results_path(slug, symbol)
 
         if os.path.exists(trades_path):
             df_t = pd.read_csv(trades_path, parse_dates=["fill_time"])

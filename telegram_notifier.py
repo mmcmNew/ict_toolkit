@@ -25,6 +25,9 @@ import json
 import ssl
 import urllib.request
 import urllib.error
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from datetime import datetime, timezone
 
 try:
@@ -100,6 +103,127 @@ def send_telegram_message(text: str, silent: bool = False) -> bool:
         print(f"⚠️ [Telegram Warning] Не удалось отправить сообщение: {e}")
 
     return False
+
+
+def send_telegram_photo(
+    photo_bytes: bytes,
+    caption: str,
+    reply_markup: dict = None,
+) -> dict:
+    """
+    Отправляет изображение (скриншот графика) с подписью и инлайн-клавиатурой.
+    Возвращает dict ответа Telegram или None.
+    """
+    token, chat_id, proxy, base_url = get_telegram_credentials()
+    if not token or not chat_id:
+        return None
+
+    url = f"{base_url}/bot{token}/sendPhoto"
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    data = {
+        "chat_id": chat_id,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+
+    files = {
+        "photo": ("chart.png", photo_bytes, "image/png"),
+    }
+
+    env_ssl = os.environ.get("SSL_VERIFY") or os.environ.get("SSL_TBANK_VERIFY")
+    if env_ssl is not None:
+        ssl_verify = env_ssl.lower() in ("true", "1", "yes")
+    else:
+        ssl_verify = getattr(cfg, "SSL_VERIFY", True) if cfg else True
+
+    try:
+        resp = requests.post(url, data=data, files=files, proxies=proxies, verify=ssl_verify, timeout=15)
+        if resp.status_code == 200:
+            return resp.json().get("result")
+        else:
+            print(f"⚠️ [Telegram Photo Error] {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"⚠️ [Telegram Warning] Не удалось отправить фото: {e}")
+
+    return None
+
+
+def notify_setup_proposal(
+    market: str,
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+    amount_str: str,
+    risk_str: str,
+    setup_reason: dict = None,
+    chart_bytes: bytes = None,
+    sig_id: str = "",
+    is_off_session: bool = False,
+) -> int:
+    """
+    Отправляет предложение по сделке со скриншотом 3-TF графика и кнопками [Открыть] / [Пропустить].
+    Возвращает message_id отправленного сообщения.
+    """
+    dir_emoji = "🟢" if str(direction).upper() in ("LONG", "1") else "🔴"
+    dir_name = "LONG" if str(direction).upper() in ("LONG", "1") else "SHORT"
+    stop_pct = abs(entry_price - stop_loss) / max(entry_price, 0.0001) * 100
+    tp_pct = abs(take_profit - entry_price) / max(entry_price, 0.0001) * 100
+
+    sr_lines = []
+    if setup_reason and isinstance(setup_reason, dict):
+        bias = setup_reason.get("bias_desc", "")
+        sweep_p = setup_reason.get("sweep_price", 0.0)
+        fvg_bot = setup_reason.get("fvg_bottom", 0.0)
+        fvg_top = setup_reason.get("fvg_top", 0.0)
+        if bias:
+            sr_lines.append(f"💡 <b>Сетап:</b> {bias} свип @ {sweep_p:,.4f}")
+        if fvg_bot and fvg_top:
+            sr_lines.append(f"📐 <b>FVG зона:</b> [{fvg_bot:,.4f} — {fvg_top:,.4f}]")
+        ai_score = setup_reason.get("ai_score")
+        if ai_score is not None:
+            sr_lines.append(f"🧠 <b>AI Score:</b> {ai_score}/10")
+
+    setup_block = ("\n" + "\n".join(sr_lines)) if sr_lines else ""
+    header = "💡 <b>ПРЕДЛОЖЕНИЕ СДЕЛКИ (ВНЕ КИЛЛЗОНЫ)</b>" if is_off_session else "⚡ <b>ПРЕДЛОЖЕНИЕ СДЕЛКИ (ТРЕБУЕТСЯ ПОДТВЕРЖДЕНИЕ)</b>"
+
+    caption = (
+        f"{header} [{html.escape(market)}]\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{dir_emoji} <b>Инструмент:</b> <code>{html.escape(symbol)}</code> (<b>{dir_name}</b>)\n"
+        f"💵 <b>Цена входа:</b> <code>{entry_price:,.4f}</code>\n"
+        f"🛑 <b>Stop-Loss:</b> <code>{stop_loss:,.4f}</code> (-{stop_pct:.2f}%)\n"
+        f"🎯 <b>Take-Profit:</b> <code>{take_profit:,.4f}</code> (+{tp_pct:.2f}%, 1.5R)\n"
+        f"📊 <b>Объем:</b> {html.escape(amount_str)}\n"
+        f"🛡️ <b>Риск:</b> {html.escape(risk_str)}"
+        f"{setup_block}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>График 3-TF: 1H (Контекст/Тренд), 15M (Свип), 5M (Вход/FVG).</i>"
+    )
+
+    reply_markup = None
+    if sig_id:
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": f"✅ Открыть {dir_name}", "callback_data": f"confirm:{sig_id}"},
+                    {"text": "❌ Пропустить", "callback_data": f"reject:{sig_id}"},
+                ]
+            ]
+        }
+
+    if chart_bytes:
+        res = send_telegram_photo(photo_bytes=chart_bytes, caption=caption, reply_markup=reply_markup)
+        if res and "message_id" in res:
+            return res["message_id"]
+
+    # Fallback на текстовое сообщение при сбое генерации изображения
+    send_telegram_message(caption)
+    return None
 
 
 def notify_bot_started(bot_name: str, mode: str, symbols: list, risk_pct: float, max_pos: int) -> bool:

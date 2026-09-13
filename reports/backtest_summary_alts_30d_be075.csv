@@ -1,0 +1,6 @@
+trades,wins,losses,winrate,total_r,avg_r,profit_factor,max_dd_r,long_trades,short_trades,symbol
+7,0,7,0.0,-7.48,-1.068,0.0,6.29,5,2,BNB/USDT
+9,0,9,0.0,-6.94,-0.771,0.0,5.77,5,4,SOL/USDT
+9,3,6,33.3,0.69,0.076,1.2,1.21,4,5,DOGE/USDT
+10,2,8,20.0,-4.44,-0.444,0.33,5.52,8,2,ADA/USDT
+35,5,30,14.3,-18.17,-0.519,0.26,20.22,22,13,PORTFOLIO TOTAL

@@ -16,6 +16,11 @@
 - reasoning: текстовое обоснование
 """
 import os
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import json
 import config as cfg
 
@@ -111,7 +116,7 @@ def evaluate_setup(setup: dict, market_context: dict = None) -> dict:
     а при отсутствии ключа — надежный quantitative fallback.
     """
     api_key = getattr(cfg, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
-    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = getattr(cfg, "GEMINI_MODEL", "gemini-3.6-flash")
 
     if not api_key:
         return _rule_based_evaluation(setup)
@@ -123,24 +128,36 @@ def evaluate_setup(setup: dict, market_context: dict = None) -> dict:
         client = genai.Client(api_key=api_key)
 
         prompt = f"""
-Ты — профессиональный количественный трейдер и эксперт по Smart Money Concepts (ICT).
-Оцени предложенный сетап на вход в сделку.
+Ты — ведущий количественный аналитик и риск-офицер хедж-фонда, торгующего по методологии Smart Money Concepts (ICT).
+Твоя цель — отсекать розничные ловушки ликвидности (Retail Traps) и подтверждать только сетапы с высоким институциональным преимуществом (Edge).
 
-Данные сетапа:
+Институциональные правила оценки (Hard Gates):
+1. ПРИОРИТЕТ МАКРО-ТРЕНДА (D1): Торговля против дневного тренда D1 строго наказывается (макс. 4 балла). Если D1 Bullish — нельзя шортить; если D1 Bearish — нельзя лонговать (особенно на акциях РФ).
+2. ДИСЦИПЛИНА КИЛЛЗОН: Сетапы вне активных сессий (07:00-10:00 и 12:00-15:00 UTC / 11:00-15:00 MSK) не имеют институционального спонсорства — штраф -2 балла.
+3. МИНИМАЛЬНЫЙ СТОП-ЛОСС: Стоп менее 0.25% уязвим для микро-сквизов и комиссий — считать ловушкой (штраф -2 балла). Оптимальный стоп: 0.35% - 0.75%.
+4. ФАКТОРЫ СЛИЯНИЯ (CONFLUENCE): Свип азиатской ликвидности (Judas Swing), Order Block в зоне и SMT-дивергенция повышают вероятность и дают +1..+2 балла.
+
+Эталонные архетипы (Few-Shot Examples):
+- Архетип 1 (ЭТАЛОН: 9/10, TAKE): D1 Bearish (-1), 1H Bearish (-1). Свип азиатского максимума внутри London Killzone прямо в медвежий Order Block. Формирование FVG с входом на 50% CE, стоп 0.45%. -> TAKE.
+- Архетип 2 (ЛОВУШКА ЛИКВИДНОСТИ: 3/10, SKIP): D1 Bullish (+1), ралли рынка. На 5m локальный свип хая, попытка войти в SHORT против дневного тренда. Order Block отсутствует, стоп 0.18%. -> SKIP (Retail trap, гарантированный стоп).
+- Архетип 3 (СЖАТИЕ В ДИАПАЗОНЕ: 5/10, CAUTION): D1 Neutral, Daily ATR сжат. Свип в середине 3-дневного боковика, цели далекие. -> CAUTION (риск возврата в безубыток 0R).
+
+Данные оцениваемого сетапа:
 - Инструмент: {setup.get('symbol', 'UNKNOWN')}
-- Направление: {'LONG' if setup.get('expected_dir') == 1 else 'SHORT'}
+- Направление сделки: {'LONG' if setup.get('expected_dir') == 1 else 'SHORT'}
 - Время свипа ликвидности: {setup.get('sweep_time')}
 - Время подтверждения (FVG): {setup.get('confirm_time')}
 - HTF Bias (1H): {'BULLISH (1)' if setup.get('bias') == 1 else 'BEARISH (-1)' if setup.get('bias') == -1 else 'NEUTRAL'}
+- Macro Trend (D1): {'BULLISH (1)' if setup.get('d1_bias') == 1 else 'BEARISH (-1)' if setup.get('d1_bias') == -1 else 'NEUTRAL'}
+- 14-day Daily ATR: {setup.get('daily_atr', 'N/A')}
 - Внутри Killzone: {setup.get('in_killzone', False)}
 - Свип экстремума Азиатской сессии: {setup.get('is_asian_sweep', False)} ({setup.get('asian_type', 'N/A')})
-- Наличие SMT-дивергенции (BTC vs ETH): {setup.get('has_smt', False)}
-- Ширина FVG зоны: {setup.get('zone_pct', 0.0)*100:.3f}% (Top: {setup.get('fvg_top')}, Bottom: {setup.get('fvg_bottom')})
+- Наличие SMT-дивергенции: {setup.get('has_smt', False)}
+- FVG зона: {setup.get('zone_pct', 0.0)*100:.3f}% (Top: {setup.get('fvg_top')}, Bottom: {setup.get('fvg_bottom')}, 50% CE: {setup.get('fvg_ce')})
 - Наличие Order Block: {setup.get('has_ob', False)}
-- Ожидаемый риск: {setup.get('risk_pct', 0.0)*100:.3f}%
-- Целевое соотношение: 2R частичный тейк + трейлинг
+- Дистанция риска (стоп): {setup.get('risk_pct', 0.0)*100:.3f}%
 
-Дополнительный контекст рынка:
+Дополнительный контекст:
 {json.dumps(market_context or {}, ensure_ascii=False, indent=2)}
 
 Требования к ответу:
@@ -148,9 +165,9 @@ def evaluate_setup(setup: dict, market_context: dict = None) -> dict:
 {{
   "score": <число от 1 до 10, где 10 — эталонный сетап высокой вероятности>,
   "recommendation": <"TAKE" | "CAUTION" | "SKIP">,
-  "confluence_strengths": [<список сильных сторон и факторов совпадения>],
-  "risk_factors": [<список потенциальных опасностей и красных флагов>],
-  "reasoning": <краткое, четкое обоснование решения в 2-3 предложениях>
+  "confluence_strengths": [<список сильных сторон>],
+  "risk_factors": [<список красных флагов>],
+  "reasoning": <четкое профессиональное обоснование решения в 2-3 предложениях>
 }}
 """
         response = client.models.generate_content(

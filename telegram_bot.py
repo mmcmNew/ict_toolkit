@@ -12,9 +12,9 @@ telegram_bot.py - Интерактивный Telegram-бот для управл
 import os
 import sys
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 import ssl
 import time
@@ -22,14 +22,37 @@ import json
 import html
 import urllib.request
 import urllib.error
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from datetime import datetime, timezone, timedelta
 
 import config as cfg
 from telegram_notifier import get_telegram_credentials
+import pending_signals as ps
 
-BITGET_TRADES_PATH = "live_trade_log.json"
-TBANK_POSITIONS_PATH = "tbank_active_positions.json"
-TBANK_TRADES_PATH = "tbank_trade_log.json"
+DATA_DIR = getattr(cfg, "DATA_DIR", "data")
+BITGET_TRADES_PATH = getattr(cfg, "TRADE_LOG_FILE", os.path.join(DATA_DIR, "live_trade_log.json"))
+TBANK_POSITIONS_PATH = getattr(cfg, "TBANK_ACTIVE_POSITIONS_FILE", os.path.join(DATA_DIR, "tbank_active_positions.json"))
+TBANK_TRADES_PATH = getattr(cfg, "TBANK_TRADE_LOG_FILE", os.path.join(DATA_DIR, "tbank_trade_log.json"))
+
+ROOT_BITGET_TRADES_PATH = "live_trade_log.json"
+ROOT_TBANK_POSITIONS_PATH = "tbank_active_positions.json"
+ROOT_TBANK_TRADES_PATH = "tbank_trade_log.json"
+
+
+def load_json_data(primary_path: str, fallback_path: str, default=None):
+    """Загружает JSON из primary_path с фоллбэком на fallback_path."""
+    path = primary_path
+    if not os.path.exists(path) and os.path.exists(fallback_path):
+        path = fallback_path
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default if default is not None else {}
+    return default if default is not None else {}
 
 
 def get_opener():
@@ -94,13 +117,7 @@ def format_stats_report() -> str:
     ]
 
     # 1. Статистика Bitget Crypto
-    bg_trades = []
-    if os.path.exists(BITGET_TRADES_PATH):
-        try:
-            with open(BITGET_TRADES_PATH, "r", encoding="utf-8") as f:
-                bg_trades = json.load(f)
-        except Exception:
-            pass
+    bg_trades = load_json_data(BITGET_TRADES_PATH, ROOT_BITGET_TRADES_PATH, default=[])
 
     bg_closed = [t for t in bg_trades if t.get("status") == "CLOSED"]
     bg_open = [t for t in bg_trades if t.get("status") == "OPEN"]
@@ -127,13 +144,7 @@ def format_stats_report() -> str:
     lines.append("")
 
     # 2. Статистика T-Bank MOEX
-    tb_trades = []
-    if os.path.exists(TBANK_TRADES_PATH):
-        try:
-            with open(TBANK_TRADES_PATH, "r", encoding="utf-8") as f:
-                tb_trades = json.load(f)
-        except Exception:
-            pass
+    tb_trades = load_json_data(TBANK_TRADES_PATH, ROOT_TBANK_TRADES_PATH, default=[])
 
     tb_closed = [t for t in tb_trades if t.get("status") == "CLOSED"]
     lines.append("🇷🇺 <b>Т-Банк (Акции Мосбиржи):</b>")
@@ -177,13 +188,7 @@ def format_positions_report() -> str:
     total_open = 0
 
     # 1. Bitget
-    bg_trades = []
-    if os.path.exists(BITGET_TRADES_PATH):
-        try:
-            with open(BITGET_TRADES_PATH, "r", encoding="utf-8") as f:
-                bg_trades = json.load(f)
-        except Exception:
-            pass
+    bg_trades = load_json_data(BITGET_TRADES_PATH, ROOT_BITGET_TRADES_PATH, default=[])
 
     bg_open = [t for t in bg_trades if t.get("status") == "OPEN"]
     lines.append(f"🪙 <b>Bitget Фьючерсы ({len(bg_open)}/5):</b>")
@@ -206,13 +211,7 @@ def format_positions_report() -> str:
     lines.append("")
 
     # 2. T-Bank
-    tb_pos = {}
-    if os.path.exists(TBANK_POSITIONS_PATH):
-        try:
-            with open(TBANK_POSITIONS_PATH, "r", encoding="utf-8") as f:
-                tb_pos = json.load(f)
-        except Exception:
-            pass
+    tb_pos = load_json_data(TBANK_POSITIONS_PATH, ROOT_TBANK_POSITIONS_PATH, default={})
 
     lines.append(f"🇷🇺 <b>Т-Банк Мосбиржа ({len(tb_pos)}/5):</b>")
     if tb_pos:
@@ -275,7 +274,10 @@ def format_balance_report() -> str:
 
     # T-Bank баланс
     try:
-        from tinkoff.invest import Client
+        try:
+            from t_tech.invest import Client
+        except ImportError:
+            from tinkoff.invest import Client
         tb_token = getattr(cfg, "TBANK_TOKEN", "") or os.environ.get("TBANK_TOKEN", "")
         account_id = getattr(cfg, "TBANK_ACCOUNT_ID", "")
         sandbox = getattr(cfg, "TBANK_SANDBOX", False)
@@ -382,6 +384,82 @@ def handle_command(text: str) -> tuple[str, dict]:
         )
 
 
+def answer_callback_query(callback_query_id: str, text: str = ""):
+    """Отправляет всплывающее уведомление в Telegram клиенте при нажатии кнопки."""
+    token, chat_id, proxy, base_url = get_telegram_credentials()
+    url = f"{base_url}/bot{token}/answerCallbackQuery"
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        requests.post(
+            url,
+            json={"callback_query_id": callback_query_id, "text": text},
+            proxies=proxies,
+            verify=False,
+            timeout=8,
+        )
+    except Exception as e:
+        print(f"⚠️ Ошибка answerCallbackQuery: {e}")
+
+
+def edit_message_caption(message_id: int, new_caption: str, reply_markup: dict = None):
+    """Обновляет подпись к отправленному фото (убирает кнопки или меняет статус)."""
+    token, chat_id, proxy, base_url = get_telegram_credentials()
+    url = f"{base_url}/bot{token}/editMessageCaption"
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    if reply_markup is None:
+        reply_markup = {"inline_keyboard": []}
+    try:
+        requests.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "caption": new_caption,
+                "parse_mode": "HTML",
+                "reply_markup": reply_markup,
+            },
+            proxies=proxies,
+            verify=False,
+            timeout=8,
+        )
+    except Exception as e:
+        print(f"⚠️ Ошибка editMessageCaption: {e}")
+
+
+def handle_callback_query(cb_id: str, data: str, msg_id: int, orig_caption: str):
+    """Обрабатывает нажатия инлайн-кнопок подтверждения или отклонения сделки."""
+    print(f"🔘 Нажата инлайн-кнопка: '{data}' (Msg ID: {msg_id})")
+    if data.startswith("confirm:"):
+        sig_id = data.split(":", 1)[1]
+        ok = ps.approve_signal(sig_id)
+        if ok:
+            answer_callback_query(cb_id, "✅ Сделка подтверждена! Ордер отправлен на биржу.")
+            new_caption = (
+                orig_caption + "\n\n"
+                "⏳ <b>СТАТУС: ПОДТВЕРЖДЕНО ПОЛЬЗОВАТЕЛЕМ</b>\n"
+                "<i>Ордер передан торговому роботу на исполнение...</i>"
+            )
+            if msg_id:
+                edit_message_caption(msg_id, new_caption)
+        else:
+            answer_callback_query(cb_id, "⚠️ Сигнал уже обработан или истек (TTL).")
+
+    elif data.startswith("reject:"):
+        sig_id = data.split(":", 1)[1]
+        ps.reject_signal(sig_id)
+        answer_callback_query(cb_id, "❌ Сетап отклонен.")
+        new_caption = (
+            orig_caption + "\n\n"
+            "❌ <b>СТАТУС: СЕТАП ОТКЛОНЕН</b>\n"
+            "<i>Сделка отменена пользователем.</i>"
+        )
+        if msg_id:
+            edit_message_caption(msg_id, new_caption)
+
+    elif data.startswith("sample_"):
+        answer_callback_query(cb_id, "Это демонстрация кнопок.")
+
+
 def run_bot_listener():
     """Основной цикл polling для получения команд из Telegram."""
     token, chat_id, proxy, base_url = get_telegram_credentials()
@@ -404,6 +482,9 @@ def run_bot_listener():
 
     while True:
         try:
+            # Очистка устаревших сигналов
+            ps.clean_stale_signals(ttl_sec=600)
+
             url = f"{base_url}/bot{token}/getUpdates?timeout=20"
             if offset is not None:
                 url += f"&offset={offset}"
@@ -422,6 +503,23 @@ def run_bot_listener():
                             update_id = u.get("update_id")
                             offset = update_id + 1
 
+                            # 1. Проверяем callback_query (нажатия инлайн-кнопок)
+                            cb = u.get("callback_query")
+                            if cb:
+                                cb_id = cb.get("id")
+                                cb_data = cb.get("data", "")
+                                user_id = str(cb.get("from", {}).get("id", ""))
+                                cb_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                                msg_id = cb.get("message", {}).get("message_id")
+                                orig_caption = cb.get("message", {}).get("caption", "")
+
+                                if user_id == chat_id or cb_chat_id == chat_id:
+                                    handle_callback_query(cb_id, cb_data, msg_id, orig_caption)
+                                else:
+                                    print(f"⚠️ Отклонен callback от неавторизованного пользователя: user={user_id}, chat={cb_chat_id}")
+                                continue
+
+                            # 2. Обычные текстовые сообщения
                             msg = u.get("message", {})
                             msg_chat_id = str(msg.get("chat", {}).get("id", ""))
                             msg_text = msg.get("text", "")
@@ -449,3 +547,4 @@ def run_bot_listener():
 
 if __name__ == "__main__":
     run_bot_listener()
+

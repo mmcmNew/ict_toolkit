@@ -17,7 +17,7 @@ services:
     container_name: ict_tbank
     build: .
     restart: unless-stopped
-    command: python -u tbank_trade.py --tickers SBER,ROSN,T,GAZP --real --yes --risk 1.0 --max-pos 5
+    command: python -u tbank_trade.py --tickers SBER,GAZP,LKOH,ROSN,YDEX --real --yes --risk 1.0 --max-pos 5
     env_file:
       - .env
     volumes:

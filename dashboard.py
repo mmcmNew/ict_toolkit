@@ -61,9 +61,21 @@ def build_dashboard(symbol: str = None):
     ob_ltf = smc.ob(df_ltf, swings_ltf)
     ob_ltf.index = df_ltf.index
 
-    trades_file = f"backtest_results_{slug}.csv"
-    if not os.path.exists(trades_file) and sym == getattr(cfg, "SYMBOL", "BTC/USDT"):
-        trades_file = "backtest_results.csv"
+    reports_dir = getattr(cfg, "REPORTS_DIR", "reports")
+    candidates = [
+        os.path.join(reports_dir, f"backtest_results_{slug}.csv"),
+        f"backtest_results_{slug}.csv",
+    ]
+    if sym == getattr(cfg, "SYMBOL", "BTC/USDT"):
+        candidates.extend([
+            os.path.join(reports_dir, "backtest_results.csv"),
+            "backtest_results.csv",
+        ])
+    trades_file = candidates[0]
+    for c in candidates:
+        if os.path.exists(c):
+            trades_file = c
+            break
 
     trades_all = pd.read_csv(trades_file, parse_dates=["sweep_time", "fill_time", "exit_time"]) \
         if os.path.exists(trades_file) else pd.DataFrame()
@@ -158,7 +170,9 @@ def build_dashboard(symbol: str = None):
     )
     fig.update_yaxes(fixedrange=False)
 
-    out_file = f"dashboard_{slug}.html"
+    reports_dir = getattr(cfg, "REPORTS_DIR", "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    out_file = os.path.join(reports_dir, f"dashboard_{slug}.html")
     fig.write_html(
         out_file, include_plotlyjs=True,
         config={"scrollZoom": True},
@@ -189,7 +203,7 @@ def build_dashboard(symbol: str = None):
         """
     )
     if sym == getattr(cfg, "SYMBOL", "BTC/USDT"):
-        fig.write_html("dashboard.html", include_plotlyjs=True, config={"scrollZoom": True})
+        fig.write_html(os.path.join(reports_dir, "dashboard.html"), include_plotlyjs=True, config={"scrollZoom": True})
 
     print(f"Готово: {out_file} ({len(df_ltf)} свечей, {len(fvg_found)} FVG, "
           f"{len(ob_found)} order blocks, {len(swept_only)} sweep, {len(trades)} сделок в окне)")

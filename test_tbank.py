@@ -137,7 +137,7 @@ def test_tbank_connection(token: str, sandbox: bool = True, tickers: list = None
                         print(f"  ℹ️ Портфель: {pe}")
 
             # [2/4] Проверка инструментов и тикеров
-            test_tickers = tickers or getattr(cfg, "TBANK_TICKERS", ["SBER", "GAZP", "LKOH", "ROSN", "YDEX", "T"])
+            test_tickers = tickers or getattr(cfg, "TBANK_TICKERS", ["SBER", "GAZP", "LKOH", "ROSN", "YDEX"])
             print(f"\n[2/4] Проверка метаданных инструментов ({len(test_tickers)} тикеров):")
             resolved_instruments = []
             for t in test_tickers:
@@ -240,7 +240,7 @@ def main():
     elif args.ticker:
         tickers = [args.ticker.strip().upper()]
     else:
-        tickers = getattr(cfg, "TBANK_TICKERS", ["SBER", "GAZP", "LKOH", "ROSN", "YDEX", "T"])
+        tickers = getattr(cfg, "TBANK_TICKERS", ["SBER", "GAZP", "LKOH", "ROSN", "YDEX"])
 
     test_tbank_connection(
         token=token,

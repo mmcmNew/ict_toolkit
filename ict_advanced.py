@@ -25,7 +25,8 @@ def compute_asian_ranges(df_1m: pd.DataFrame, asian_hours: tuple = (0, 6)) -> di
     ranges = {}
     grouped = asian_bars.groupby(asian_bars.index.date)
     for d, group in grouped:
-        if len(group) >= 30:  # минимум 30 минут данных для валидного диапазона
+        # Валидный диапазон: минимум 30 минут данных (>=30 баров для 1m или >=6 баров для 5m)
+        if len(group) >= 6:
             ranges[d] = {
                 "high": float(group["high"].max()),
                 "low": float(group["low"].min()),
@@ -40,6 +41,10 @@ def is_asian_range_sweep(sweep_time, sweep_candle, asian_ranges: dict, tolerance
     Проверяет, снял ли свип максимум или минимум Азиатской сессии текущего дня.
     Возвращает (is_sweep, 'ASIAN_HIGH' | 'ASIAN_LOW' | None).
     """
+    # Азиатская сессия длится до 06:00 UTC. Свип азиатской ликвидности возможен только ПОСЛЕ её окончания
+    if hasattr(sweep_time, "hour") and sweep_time.hour < 6:
+        return False, None
+
     d = sweep_time.date()
     ar = asian_ranges.get(d)
     if not ar:

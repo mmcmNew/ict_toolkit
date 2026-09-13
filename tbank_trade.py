@@ -9,7 +9,7 @@ Live/Demo/Sandbox торговый бот для T-Bank Invest API (t-tech-inves
 - Расчет размера позиции по риску (% от рублевого депозита) с учетом лотности акций MOEX.
 - Контроль статуса биржевых торгов (Мосбиржа: проверка NORMAL_TRADING).
 - Стратегию ICT Smart Money: 1H Bias + 5m Liquidity Sweep + FVG confirmation.
-- Сопровождение сделок: частичный тейк 50% на 1.5R и трейлинг-стоп остатка на 0.8R.
+- Сопровождение сделок: частичный тейк 50% на 2.5R (настраивается через config / --tp-r) и трейлинг-стоп остатка на 0.8R.
 - ИИ-валидацию сетапов через Google Gemini (--ai).
 - Сбор статистики и истории сделок (--stats) в tbank_trade_log.json.
 
@@ -57,18 +57,31 @@ from strategy import resample, compute_bias_series, bias_at, in_killzone
 from ict_advanced import compute_asian_ranges, is_asian_range_sweep
 from ai_evaluator import evaluate_setup
 import telegram_notifier as tg
+import chart_generator as cg
+import pending_signals as ps
 
-SEEN_SIGNALS_PATH = "tbank_seen_signals.json"
-TRADE_LOG_PATH = "tbank_trade_log.json"
-ACTIVE_POSITIONS_PATH = "tbank_active_positions.json"
+DATA_DIR = getattr(cfg, "DATA_DIR", "data")
+SEEN_SIGNALS_PATH = getattr(cfg, "TBANK_SEEN_SIGNALS_FILE", os.path.join(DATA_DIR, "tbank_seen_signals.json"))
+TRADE_LOG_PATH = getattr(cfg, "TBANK_TRADE_LOG_FILE", os.path.join(DATA_DIR, "tbank_trade_log.json"))
+ACTIVE_POSITIONS_PATH = getattr(cfg, "TBANK_ACTIVE_POSITIONS_FILE", os.path.join(DATA_DIR, "tbank_active_positions.json"))
+
+ROOT_SEEN_SIGNALS_PATH = "tbank_seen_signals.json"
+ROOT_TRADE_LOG_PATH = "tbank_trade_log.json"
+ROOT_ACTIVE_POSITIONS_PATH = "tbank_active_positions.json"
 LOOKBACK_BARS_1M = 1000  # минутные свечи для построения 5m и 1h
 
 
 def load_seen():
-    if os.path.exists(SEEN_SIGNALS_PATH):
+    path = SEEN_SIGNALS_PATH
+    if not os.path.exists(path) and os.path.exists(ROOT_SEEN_SIGNALS_PATH):
+        path = ROOT_SEEN_SIGNALS_PATH
+    if os.path.exists(path):
         try:
-            with open(SEEN_SIGNALS_PATH, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+            with open(path, "r", encoding="utf-8") as f:
+                data = set(json.load(f))
+            if path != SEEN_SIGNALS_PATH and not os.path.exists(SEEN_SIGNALS_PATH):
+                save_seen(data)
+            return data
         except Exception:
             return set()
     return set()
@@ -76,6 +89,7 @@ def load_seen():
 
 def save_seen(seen):
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(SEEN_SIGNALS_PATH)), exist_ok=True)
         with open(SEEN_SIGNALS_PATH, "w", encoding="utf-8") as f:
             json.dump(list(seen), f, indent=2)
     except Exception as e:
@@ -83,10 +97,16 @@ def save_seen(seen):
 
 
 def load_trades():
-    if os.path.exists(TRADE_LOG_PATH):
+    path = TRADE_LOG_PATH
+    if not os.path.exists(path) and os.path.exists(ROOT_TRADE_LOG_PATH):
+        path = ROOT_TRADE_LOG_PATH
+    if os.path.exists(path):
         try:
-            with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if path != TRADE_LOG_PATH and not os.path.exists(TRADE_LOG_PATH):
+                save_trades(data)
+            return data
         except Exception:
             return []
     return []
@@ -94,6 +114,7 @@ def load_trades():
 
 def save_trades(trades):
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(TRADE_LOG_PATH)), exist_ok=True)
         with open(TRADE_LOG_PATH, "w", encoding="utf-8") as f:
             json.dump(trades, f, indent=2, default=str)
     except Exception as e:
@@ -102,10 +123,16 @@ def save_trades(trades):
 
 def load_active_positions() -> dict:
     """Загружает сохраненные открытые позиции из JSON-файла состояния."""
-    if os.path.exists(ACTIVE_POSITIONS_PATH):
+    path = ACTIVE_POSITIONS_PATH
+    if not os.path.exists(path) and os.path.exists(ROOT_ACTIVE_POSITIONS_PATH):
+        path = ROOT_ACTIVE_POSITIONS_PATH
+    if os.path.exists(path):
         try:
-            with open(ACTIVE_POSITIONS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if path != ACTIVE_POSITIONS_PATH and not os.path.exists(ACTIVE_POSITIONS_PATH):
+                save_active_positions(data)
+            return data
         except Exception as e:
             print(f"⚠️ Предупреждение: не удалось прочитать активные позиции: {e}")
             return {}
@@ -115,6 +142,7 @@ def load_active_positions() -> dict:
 def save_active_positions(positions: dict):
     """Сохраняет текущие открытые позиции в JSON-файл для персистентности между перезапусками."""
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(ACTIVE_POSITIONS_PATH)), exist_ok=True)
         with open(ACTIVE_POSITIONS_PATH, "w", encoding="utf-8") as f:
             json.dump(positions, f, indent=2, default=str)
     except Exception as e:
@@ -409,11 +437,13 @@ def place_order(client, account_id: str, figi: str, direction_str: str,
 
 def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                   risk_pct: float, use_ai: bool, use_asian: bool, use_kz: bool,
-                  poll_sec: int, max_pos: int = 5):
+                  poll_sec: int, max_pos: int = 5, confirm: bool = False,
+                  take_r: float = None):
     from t_tech.invest import Client, CandleInterval
     from t_tech.invest.constants import INVEST_GRPC_API, INVEST_GRPC_API_SANDBOX
 
     target = INVEST_GRPC_API_SANDBOX if sandbox else INVEST_GRPC_API
+    take_r = take_r if take_r is not None else getattr(cfg, "TBANK_PARTIAL_TAKE_R", 2.5)
 
     print("=" * 80)
     print("      ЗАПУСК ICT СМАРТ-МАНИ БОТА: T-BANK INVEST API (МОСБИРЖА)")
@@ -424,9 +454,11 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
     print(f"Режим работы:           {mode_str}")
     print(f"Корзина тикеров ({len(tickers)}):   {', '.join(tickers)}")
     print(f"Риск на сделку:         {risk_pct:.1f}% от баланса депозита")
+    print(f"Тейк-профит (TP1):      {take_r:.1f}R (частичная фиксация 50%, трейлинг 0.8R)")
     print(f"Лимит позиций:          до {max_pos} одновременных сделок")
     print(f"Фильтр Asian Range:     {'ВКЛЮЧЕН' if use_asian else 'ВЫКЛЮЧЕН'}")
     print(f"Фильтр Киллзон (MOEX):  {'ВКЛЮЧЕН (10:00-14:00, 16:30-18:40 МСК)' if use_kz else 'ВЫКЛЮЧЕН'}")
+    print(f"Подтверждение Telegram: {'ВКЛЮЧЕНО для всех сделок' if confirm else 'ВКЛЮЧЕНО для сделок вне Киллзон'}")
     print(f"Google Gemini ИИ-оценка:{'ВКЛЮЧЕНА' if use_ai else 'ВЫКЛЮЧЕНА'}")
     print(f"Интервал опроса:        {poll_sec} сек.")
     print("=" * 80)
@@ -451,30 +483,34 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                 sb_accounts = client.sandbox.get_sandbox_accounts().accounts
                 if not sb_accounts:
                     print("Создание виртуального счёта в песочнице...")
-                    res = client.sandbox.open_sandbox_account()
-                    account_id = res.account_id
+                    sb_account = client.sandbox.open_sandbox_account()
+                    account_id = sb_account.account_id
+                    print(f"Создан виртуальный счёт: {account_id}")
+                    print("Пополнение счёта на 1,000,000 руб...")
+                    client.sandbox.sandbox_pay_in(
+                        account_id=account_id,
+                        amount={"currency": "rub", "units": 1000000, "nano": 0}
+                    )
                 else:
                     account_id = sb_accounts[0].id
             else:
-                user_accounts = client.users.get_accounts().accounts
-                if not user_accounts:
-                    raise RuntimeError("У пользователя нет активных брокерских счетов в Т-Банке!")
-                account_id = user_accounts[0].id
+                real_accounts = client.users.get_accounts().accounts
+                if real_accounts:
+                    account_id = real_accounts[0].id
 
         print(f"Используется счёт ID: {account_id}\n")
 
-        # Резолвинг инструментов
         meta_by_ticker = {}
         for t in tickers:
-            meta = resolve_tbank_instrument(client, t, class_code=getattr(cfg, "TBANK_CLASS_CODE", "TQBR"))
-            meta_by_ticker[t] = meta
-            print(f"  • {t:<6} -> {meta['name']} | FIGI: {meta['figi']} | 1 лот = {meta['lot']} шт.")
+            try:
+                meta = resolve_tbank_instrument(client, t)
+                meta_by_ticker[t] = meta
+            except Exception as e:
+                print(f"⚠️ Ошибка резолвинга тикера {t}: {e}")
 
-        # Сверка активных позиций с реальным портфелем брокера
-        if not paper:
-            active_positions = reconcile_positions_with_broker(client, account_id, active_positions, meta_by_ticker, sandbox)
+        # Сверка активных позиций с портфелем брокера
+        reconcile_positions_with_broker(client, account_id, active_positions, meta_by_ticker, sandbox)
 
-        # Предполетная проверка баланса
         init_balance = get_account_rub_balance(client, account_id, sandbox)
         print(f"\nТекущий свободный баланс: {init_balance:,.2f} RUB")
         print("Начинаю мониторинг рынка...\n")
@@ -494,6 +530,87 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                 now_utc = datetime.now(timezone.utc)
                 now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
                 print(f"[{now_str}] Итерация #{iteration} | Позиций открыто: {len(active_positions)}/{max_pos}")
+
+                # 0. Исполнение сигналов, подтвержденных пользователем в Telegram
+                approved_signals = ps.get_approved_signals(market="tbank")
+                for sig in approved_signals:
+                    sig_id = sig["id"]
+                    t = sig["symbol"]
+                    direction = "LONG" if sig["direction"] == 1 else "SHORT"
+                    pos_calc = sig["pos_calc"]
+                    setup_reason = sig["setup_reason"]
+                    figi = pos_calc.get("figi") or meta_by_ticker.get(t, {}).get("figi")
+                    lots = pos_calc.get("lots", 1)
+                    inst = meta_by_ticker.get(t, {})
+                    if not figi or not inst:
+                        continue
+
+                    print(f"\n🚀 [TELEGRAM ОДОБРЕНИЕ] Пользователь подтвердил вход в акцию {t} ({direction})!")
+                    try:
+                        p_resp = client.market_data.get_last_prices(instrument_id=[figi])
+                        curr_price = float(p_resp.last_prices[0].price.units + p_resp.last_prices[0].price.nano / 1e9)
+
+                        # Проверка инвалидации по SL / TP перед входом
+                        if direction == "LONG":
+                            if curr_price <= sig["stop_loss"]:
+                                print(f"⚠️ [Инвалидация] Цена {curr_price:.2f} <= SL {sig['stop_loss']:.2f} на {t}. Ордер отменен.")
+                                ps.mark_failed(sig_id, f"Инвалидация: цена ({curr_price:.2f}) пробила SL ({sig['stop_loss']:.2f})")
+                                continue
+                            if curr_price >= sig["take_profit"]:
+                                print(f"⚠️ [Инвалидация] Цена {curr_price:.2f} >= TP {sig['take_profit']:.2f} на {t}. Ордер отменен.")
+                                ps.mark_failed(sig_id, f"Инвалидация: цена ({curr_price:.2f}) уже достигла TP ({sig['take_profit']:.2f})")
+                                continue
+                        else:
+                            if curr_price >= sig["stop_loss"]:
+                                print(f"⚠️ [Инвалидация] Цена {curr_price:.2f} >= SL {sig['stop_loss']:.2f} на {t}. Ордер отменен.")
+                                ps.mark_failed(sig_id, f"Инвалидация: цена ({curr_price:.2f}) пробила SL ({sig['stop_loss']:.2f})")
+                                continue
+                            if curr_price <= sig["take_profit"]:
+                                print(f"⚠️ [Инвалидация] Цена {curr_price:.2f} <= TP {sig['take_profit']:.2f} на {t}. Ордер отменен.")
+                                ps.mark_failed(sig_id, f"Инвалидация: цена ({curr_price:.2f}) уже достигла TP ({sig['take_profit']:.2f})")
+                                continue
+
+                        slip_pct = abs(curr_price - sig["entry_price"]) / max(sig["entry_price"], 0.01) * 100
+                        if slip_pct > 0.8:
+                            print(f"⚠️ [Отклонено] Проскальзывание {slip_pct:.2f}% > 0.8% на {t}. Ордер отменен.")
+                            ps.mark_failed(sig_id, f"Проскальзывание {slip_pct:.2f}%")
+                            continue
+
+                        order_res = place_order(client, account_id, figi, direction, lots, sandbox, paper)
+                        if order_res:
+                            risk_distance = abs(curr_price - sig["stop_loss"])
+                            tp1_target = curr_price + (take_r * risk_distance) if direction == "LONG" else curr_price - (take_r * risk_distance)
+                            active_positions[t] = {
+                                "ticker": t,
+                                "dir": direction,
+                                "entry_price": curr_price,
+                                "current_stop": sig["stop_loss"],
+                                "tp1_price": tp1_target,
+                                "take_r": take_r,
+                                "r_unit": risk_distance,
+                                "total_lots": lots,
+                                "remaining_lots": lots,
+                                "partial_taken": False,
+                                "open_time": str(now_utc),
+                                "setup_reason": setup_reason,
+                            }
+                            save_active_positions(active_positions)
+                            ps.mark_executed(sig_id, {"fill_price": curr_price, "order_res": str(order_res)})
+                            tg.notify_trade_opened(
+                                market="T-Bank MOEX",
+                                symbol=t,
+                                direction=direction,
+                                entry_price=curr_price,
+                                stop_loss=sig["stop_loss"],
+                                take_profit=tp1_target,
+                                amount_str=f"{lots} лот ({lots * inst['lot']} шт.)",
+                                risk_str=f"{risk_pct:.1f}%",
+                                setup_reason=setup_reason,
+                            )
+                            print(f"✅ [УСПЕХ] Ордер по акции {t} успешно открыт через Telegram-подтверждение!\n")
+                    except Exception as e:
+                        print(f"❌ Ошибка исполнения подтвержденного ордера {t}: {e}")
+                        ps.mark_failed(sig_id, str(e))
 
                 # 1. Сопровождение открытых позиций
                 for t, pos in list(active_positions.items()):
@@ -554,10 +671,12 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                             )
                             continue
 
-                        # Частичный тейк 1.5R (50%)
+                        # Частичный тейк (take_r, 50%)
+                        pos_take_r = pos.get("take_r", take_r)
                         if not pos["partial_taken"] and curr_price >= tp1_p:
-                            take_lots = max(1, pos["total_lots"] // 2)
-                            print(f"  🎯 [{t}] ЧАСТИЧНЫЙ ТЕЙК (1.5R) достигнут на {curr_price:.2f}! Фиксация {take_lots} лот.")
+                            take_size = getattr(cfg, "TBANK_PARTIAL_TAKE_SIZE", 0.5)
+                            take_lots = max(1, int(pos["total_lots"] * take_size))
+                            print(f"  🎯 [{t}] ЧАСТИЧНЫЙ ТЕЙК ({pos_take_r:.1f}R) достигнут на {curr_price:.2f}! Фиксация {take_lots} лот.")
                             place_order(client, account_id, inst["figi"], "SHORT", take_lots, sandbox, paper)
                             pos["partial_taken"] = True
                             pos["remaining_lots"] -= take_lots
@@ -578,7 +697,8 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
 
                         # Трейлинг остатка
                         if pos["partial_taken"]:
-                            new_trail = curr_price - (0.8 * r_unit)
+                            trail_dist_r = getattr(cfg, "TBANK_TRAIL_DISTANCE_R", 0.8)
+                            new_trail = curr_price - (trail_dist_r * r_unit)
                             if new_trail > pos["current_stop"]:
                                 pos["current_stop"] = new_trail
                                 save_active_positions(active_positions)
@@ -600,6 +720,16 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                 # 3. Поиск новых входов по корзине
                 if len(active_positions) >= max_pos:
                     print(f"  ℹ️ Лимит открытых позиций ({max_pos}) достигнут. Ожидание сопровождения...")
+                    time.sleep(poll_sec)
+                    continue
+
+                # Проверка исключенных дней недели (например, Четверг - экспирации FORTS)
+                now_msk_dt = now_utc + pd.Timedelta(hours=3)
+                current_dow = now_msk_dt.strftime("%A")
+                exclude_days = getattr(cfg, "MOEX_EXCLUDE_DAYS", ["Thursday"])
+                if current_dow in exclude_days:
+                    sys.stdout.write(f"\r[MOEX {now_msk}] ⏸️ {current_dow} исключен из торговли (день экспираций). Мониторинг позиций...   ")
+                    sys.stdout.flush()
                     time.sleep(poll_sec)
                     continue
 
@@ -635,8 +765,7 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
 
                     # Для акций на Мосбирже без маржинального шорта торгуем только LONG
                     if curr_bias == -1:
-                        # Если не включена маржиналка, пропускаем шорты
-                        pass
+                        continue
 
                     # Проверка LTF Swings & Sweeps
                     swings_ltf = smc.swing_highs_lows(df_ltf, swing_length=cfg.SWING_LENGTH_LTF)
@@ -647,13 +776,19 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                     if len(swept) == 0:
                         continue
 
-                    last_sweep_time = swept.index[-1]
                     last_sweep = swept.iloc[-1]
-                    sweep_dir = int(last_sweep["Swept"])
+                    swept_bar_idx = int(last_sweep["Swept"])
+                    if swept_bar_idx <= 0 or swept_bar_idx >= len(df_ltf):
+                        continue
+
+                    last_sweep_time = df_ltf.index[swept_bar_idx]
+                    expected_dir = 1 if last_sweep["Liquidity"] == -1 else -1
 
                     # Свип должен совпадать с 1H трендом
-                    if sweep_dir != curr_bias:
+                    if expected_dir != curr_bias:
                         continue
+
+                    sweep_candle = df_ltf.iloc[swept_bar_idx]
 
                     # Проверка FVG
                     fvg_ltf = smc.fvg(df_ltf)
@@ -666,6 +801,12 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
 
                     best_fvg = matching_fvgs.iloc[-1]
                     fvg_time = matching_fvgs.index[-1]
+                    fvg_top, fvg_bottom = float(best_fvg["Top"]), float(best_fvg["Bottom"])
+                    zone_pct = abs(fvg_top - fvg_bottom) / max(fvg_bottom, 0.0001)
+                    min_fvg = getattr(cfg, "MIN_FVG_ZONE_PCT", 0.0005)
+                    if zone_pct < min_fvg:
+                        continue
+
                     sig_id = f"{t}_{fvg_time}_{curr_bias}"
 
                     if sig_id in seen_signals:
@@ -674,7 +815,6 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                     # Параметры сделки
                     direction = "LONG" if curr_bias == 1 else "SHORT"
                     fill_price = float(df_1m["close"].iloc[-1])
-                    sweep_candle = df_ltf.loc[last_sweep_time]
                     buffer = fill_price * 0.0008
 
                     if direction == "LONG":
@@ -687,19 +827,23 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                     if risk_distance <= 0 or risk_distance / fill_price < cfg.MIN_RISK_PCT:
                         continue
 
+                    # Проверка Киллзон (MOEX)
+                    is_kz = in_killzone(now_utc, cfg.MOEX_KILLZONES) if use_kz else True
+
                     # ИИ-валидация через Gemini (при включении)
                     if use_ai:
-                        ai_score, ai_reason = evaluate_setup(
-                            symbol=t,
-                            direction=direction,
-                            timeframe="5m",
-                            bias=curr_bias,
-                            fvg_size_pct=abs(best_fvg["Top"] - best_fvg["Bottom"]) / fill_price,
-                            stop_distance_pct=risk_distance / fill_price,
-                            is_killzone=True,
-                            in_asian_range=True,
-                            has_smt=False
-                        )
+                        eval_payload = {
+                            "symbol": t,
+                            "expected_dir": 1 if direction == "LONG" else -1,
+                            "sweep_time": str(last_sweep_time),
+                            "bias": curr_bias,
+                            "in_killzone": bool(use_kz and is_kz),
+                            "zone_pct": abs(best_fvg["Top"] - best_fvg["Bottom"]) / fill_price,
+                            "risk_pct": risk_distance / fill_price,
+                        }
+                        ai_eval = evaluate_setup(eval_payload)
+                        ai_score = ai_eval.get("score", 5)
+                        ai_reason = ai_eval.get("reasoning", "")
                         print(f"  🧠 AI Evaluator для {t}: Оценка {ai_score}/10 | {ai_reason}")
                         if ai_score < cfg.AI_CONFIDENCE_THRESHOLD:
                             print(f"  ⚠️ Сетап {t} отклонён ИИ (балл {ai_score} < {cfg.AI_CONFIDENCE_THRESHOLD})")
@@ -740,41 +884,101 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                         save_seen(seen_signals)
                         continue
 
-                    # Вход в сделку!
+                    # Проверка Киллзон и подтверждения через Telegram
+                    is_kz = in_killzone(now_utc, cfg.MOEX_KILLZONES) if use_kz else True
+                    need_confirm = confirm or (use_kz and not is_kz)
+
+                    # Формирование 3-TF скриншота графика
+                    chart_bytes = None
+                    tp1_target = fill_price + (take_r * risk_distance) if direction == "LONG" else fill_price - (take_r * risk_distance)
+                    try:
+                        df_15m = resample(df_1m, "15min")
+                        chart_bytes = cg.generate_3tf_setup_chart(
+                            df_1h=df_htf,
+                            df_15m=df_15m,
+                            df_5m=df_ltf,
+                            symbol=t,
+                            direction=direction,
+                            entry_price=fill_price,
+                            stop_loss=stop_loss,
+                            take_profit=tp1_target,
+                            sweep_price=float(sweep_candle["low"] if direction == "LONG" else sweep_candle["high"]),
+                            fvg_bottom=float(best_fvg["Bottom"]),
+                            fvg_top=float(best_fvg["Top"]),
+                            bias_desc="BULLISH" if curr_bias == 1 else "BEARISH",
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Ошибка формирования графика 3-TF: {e}")
+
+                    setup_reason = {
+                        "bias": curr_bias,
+                        "bias_desc": "BULLISH" if curr_bias == 1 else "BEARISH",
+                        "sweep_time": str(last_sweep_time),
+                        "sweep_price": float(sweep_candle["low"] if direction == "LONG" else sweep_candle["high"]),
+                        "sweep_dir": expected_dir,
+                        "fvg_bottom": float(best_fvg["Bottom"]),
+                        "fvg_top": float(best_fvg["Top"]),
+                        "fvg_time": str(fvg_time),
+                        "risk_distance": float(risk_distance),
+                        "risk_distance_pct": round(float(risk_distance / fill_price) * 100, 2),
+                        "asian_range_sweep": bool(use_asian),
+                        "in_killzone": bool(use_kz and is_kz),
+                        "ai_score": ai_score if use_ai else None,
+                        "ai_reason": ai_reason if use_ai else None,
+                    }
+
+                    if need_confirm:
+                        session_status = "ВНЕ КИЛЛЗОНЫ МОСБИРЖИ" if not is_kz else "РЕЖИМ ПОДТВЕРЖДЕНИЯ"
+                        print(f"\n💡 [{session_status}] Сетап {t} ({direction}) по {fill_price:.2f} RUB отправлен в Telegram.")
+                        print(f"   Скриншот 3-TF и кнопки подтверждения направлены пользователю.\n")
+                        sig_id_ps = ps.create_pending_signal(
+                            market="tbank",
+                            symbol=t,
+                            direction=1 if direction == "LONG" else -1,
+                            entry_price=fill_price,
+                            stop_loss=stop_loss,
+                            take_profit=tp1_target,
+                            pos_calc={"lots": lots, "shares": lots * inst["lot"], "cost_rub": total_trade_cost, "figi": figi},
+                            setup_reason=setup_reason,
+                        )
+                        msg_id = tg.notify_setup_proposal(
+                            market="T-Bank MOEX",
+                            symbol=t,
+                            direction=direction,
+                            entry_price=fill_price,
+                            stop_loss=stop_loss,
+                            take_profit=tp1_target,
+                            amount_str=f"{lots} лот ({lots * inst['lot']} шт.) ~{total_trade_cost:,.2f} RUB",
+                            risk_str=f"{risk_pct:.1f}% (~{risk_amount_rub:,.2f} RUB)",
+                            setup_reason=setup_reason,
+                            chart_bytes=chart_bytes,
+                            sig_id=sig_id_ps,
+                            is_off_session=bool(use_kz and not is_kz),
+                        )
+                        if msg_id:
+                            ps.set_signal_message_id(sig_id_ps, msg_id)
+                        seen_signals.add(sig_id)
+                        save_seen(seen_signals)
+                        continue
+
+                    # Прямой вход в сделку внутри Киллзоны
                     print("\n" + "*" * 75)
                     print(f"  🔥 СИГНАЛ ICT НА ВХОД: {t} {direction}!")
                     print(f"  Цена входа:        {fill_price:.2f} RUB")
                     print(f"  Стоп-лосс:         {stop_loss:.2f} RUB (дистанция: {risk_distance:.2f} RUB / {(risk_distance/fill_price)*100:.2f}%)")
-                    print(f"  Тейк 1.5R (50%):   {fill_price + 1.5 * risk_distance if direction == 'LONG' else fill_price - 1.5 * risk_distance:.2f} RUB")
+                    print(f"  Тейк {take_r:.1f}R (50%):   {tp1_target:.2f} RUB")
                     print(f"  Объем:             {lots} лот ({lots * inst['lot']} акций) = {total_trade_cost:,.2f} RUB")
                     print("*" * 75 + "\n")
 
                     order_res = place_order(client, account_id, figi, direction, lots, sandbox, paper)
                     if order_res:
-                        fee_buffer = fill_price * (cfg.TBANK_COMMISSION_PCT * 2)
-                        tp1_target = fill_price + (1.5 * risk_distance) + fee_buffer if direction == "LONG" else fill_price - (1.5 * risk_distance) - fee_buffer
-                        setup_reason = {
-                            "bias": curr_bias,
-                            "bias_desc": "BULLISH" if curr_bias == 1 else "BEARISH",
-                            "sweep_time": str(last_sweep_time),
-                            "sweep_price": float(sweep_candle["low"] if direction == "LONG" else sweep_candle["high"]),
-                            "sweep_dir": sweep_dir,
-                            "fvg_bottom": float(best_fvg["Bottom"]),
-                            "fvg_top": float(best_fvg["Top"]),
-                            "fvg_time": str(fvg_time),
-                            "risk_distance": float(risk_distance),
-                            "risk_distance_pct": round(float(risk_distance / fill_price) * 100, 2),
-                            "asian_range_sweep": bool(use_asian),
-                            "in_killzone": bool(use_kz),
-                            "ai_score": ai_score if use_ai else None,
-                            "ai_reason": ai_reason if use_ai else None,
-                        }
                         active_positions[t] = {
                             "ticker": t,
                             "dir": direction,
                             "entry_price": fill_price,
                             "current_stop": stop_loss,
                             "tp1_price": tp1_target,
+                            "take_r": take_r,
                             "r_unit": risk_distance,
                             "total_lots": lots,
                             "remaining_lots": lots,
@@ -796,8 +1000,15 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                             risk_str=f"{risk_pct:.1f}% (~{risk_amount_rub:,.2f} RUB)",
                             setup_reason=setup_reason,
                         )
+                        if chart_bytes:
+                            tg.send_telegram_photo(chart_bytes, caption=f"📸 <b>3-TF График открытой сделки MOEX:</b> <code>{t}</code>")
 
-                time.sleep(poll_sec)
+                # Реактивный сон
+                for _ in range(max(1, poll_sec)):
+                    if ps.get_approved_signals(market="tbank"):
+                        break
+                    time.sleep(1)
+
 
         except KeyboardInterrupt:
             print("\n⏹️ Бот остановлен пользователем (Ctrl+C).")
@@ -816,6 +1027,8 @@ def main():
     parser.add_argument("--ai", action="store_true", help="Включить Gemini ИИ-оценку сетапов")
     parser.add_argument("--asian-range", action="store_true", help="Фильтр азиатской сессии")
     parser.add_argument("--killzones", action="store_true", help="Фильтр торговых часов")
+    parser.add_argument("--confirm", action="store_true", help="Запрашивать подтверждение сделок через Telegram для всех сделок со скриншотом 3-TF")
+    parser.add_argument("--tp-r", type=float, default=getattr(cfg, "TBANK_PARTIAL_TAKE_R", 2.5), help="Тейк-профит в R (по умолчанию: 2.5R для акций РФ)")
     parser.add_argument("--max-pos", type=int, default=getattr(cfg, "TBANK_MAX_POSITIONS", 5), help="Максимум одновременно открытых позиций (по умолчанию 5)")
     parser.add_argument("--poll", type=int, default=60, help="Периодичность проверки рынка в секундах (по умолчанию 60)")
     parser.add_argument("-y", "--yes", action="store_true", help="Автоматическое подтверждение запуска на реальном счете")
@@ -871,7 +1084,7 @@ def main():
     elif args.ticker:
         tickers = [args.ticker.strip().upper()]
     elif args.all:
-        tickers = getattr(cfg, "TBANK_TICKERS", ["SBER", "GAZP", "LKOH", "ROSN", "YDEX", "T"])
+        tickers = getattr(cfg, "TBANK_TICKERS", ["SBER", "GAZP", "LKOH", "ROSN", "YDEX"])
     else:
         tickers = [getattr(cfg, "TBANK_TICKER", "SBER")]
 
@@ -885,7 +1098,9 @@ def main():
         use_asian=args.asian_range or getattr(cfg, "USE_ASIAN_RANGE_FILTER", False),
         use_kz=args.killzones or getattr(cfg, "USE_KILLZONES", False),
         poll_sec=args.poll,
-        max_pos=args.max_pos
+        max_pos=args.max_pos,
+        confirm=args.confirm,
+        take_r=args.tp_r,
     )
 
 

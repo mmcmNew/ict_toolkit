@@ -1,0 +1,3 @@
+trades,wins,losses,winrate,total_r,avg_r,profit_factor,max_dd_r,long_trades,short_trades,symbol
+4,1,3,25.0,1.57,0.392,2.3,0.0,1,3,DOGE/USDT
+4,1,3,25.0,1.57,0.392,2.3,0.0,1,3,PORTFOLIO TOTAL
