@@ -404,9 +404,19 @@ def run_single_symbol(symbol: str, use_ai: bool = False, ai_filter: bool = False
     candidates = find_candidates(df_htf, df_ltf, cfg, df_1m=df_1m, smt_df=smt_df)
     print(f"[{symbol}] Кандидатов на сделку: {len(candidates)}")
 
-    res = simulate(df_1m, df_htf, df_ltf, candidates, stop_mode=cfg.STOP_MODE,
-                   symbol=symbol, use_ai=use_ai, ai_filter=ai_filter,
-                   max_positions=max_positions)
+    from core_engine import simulate_grid_b
+    is_moex = cfg.DATA_SOURCE in ("tbank", "tinkoff")
+    res, metrics = simulate_grid_b(
+        df_1m, df_htf, df_ltf, candidates,
+        symbol=symbol, is_moex=is_moex,
+        use_vol_filter=getattr(cfg, "USE_VOLATILITY_FILTER", True),
+        min_fvg_pct=getattr(cfg, "MIN_FVG_ZONE_PCT", 0.0005),
+        min_atr_5m_pct=getattr(cfg, "MIN_ATR_5M_PCT", 0.0005),
+        use_trend_filter=getattr(cfg, "USE_TREND_FILTER", True),
+        min_adx=getattr(cfg, "MIN_ADX_1H", 20.0),
+        use_ai=use_ai, ai_filter=ai_filter,
+        max_positions=max_positions
+    )
 
     # Сохраняем индивидуальный файл сделок
     slug = get_symbol_slug(symbol)
@@ -417,8 +427,6 @@ def run_single_symbol(symbol: str, use_ai: bool = False, ai_filter: bool = False
     if symbol == getattr(cfg, "SYMBOL", "BTC/USDT"):
         res.to_csv(os.path.join(reports_dir, "backtest_results.csv"), index=False)
 
-    metrics = compute_metrics(res)
-    metrics["symbol"] = symbol
     return res, metrics
 
 

@@ -56,6 +56,8 @@ from data_sources import resolve_tbank_instrument
 from strategy import resample, compute_bias_series, bias_at, in_killzone
 from ict_advanced import compute_asian_ranges, is_asian_range_sweep
 from ai_evaluator import evaluate_setup
+from ai_circuit_breaker import is_pair_disabled_today, record_trade_and_check_circuit_breaker, evaluate_pre_trading_universe_ai
+from trend_filter import is_market_trending
 import telegram_notifier as tg
 import chart_generator as cg
 import pending_signals as ps
@@ -523,12 +525,32 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
             max_pos=max_pos,
         )
 
+        # Пре-маркет ИИ-оценка рыночного режима по акциям РФ
+        try:
+            evaluate_pre_trading_universe_ai(tickers, market="moex", send_tg=True)
+        except Exception as e:
+            print(f"⚠️ Ошибка пре-маркет ИИ-оценки акций: {e}")
+
         try:
             iteration = 0
             while True:
                 iteration += 1
                 now_utc = datetime.now(timezone.utc)
                 now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                # Динамическая синхронизация корзины акций РФ из data/active_universe.json
+                try:
+                    u_file = getattr(cfg, "ACTIVE_UNIVERSE_FILE", "data/active_universe.json")
+                    if os.path.exists(u_file):
+                        with open(u_file, "r", encoding="utf-8") as _uf:
+                            _u_data = json.load(_uf)
+                        _moex_syms = _u_data.get("moex", [])
+                        if _moex_syms and set(_moex_syms) != set(tickers):
+                            print(f"\n🔄 [Universe Update] Применена обновленная корзина MOEX из Telegram: {_moex_syms}\n")
+                            tickers = _moex_syms
+                except Exception:
+                    pass
+
                 print(f"[{now_str}] Итерация #{iteration} | Позиций открыто: {len(active_positions)}/{max_pos}")
 
                 # 0. Исполнение сигналов, подтвержденных пользователем в Telegram
@@ -669,6 +691,7 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                                 currency="RUB",
                                 net_r=net_r,
                             )
+                            record_trade_and_check_circuit_breaker(t, outcome=exit_reason, r_net=net_r, exit_time=str(now_utc))
                             continue
 
                         # Частичный тейк (take_r, 50%)
@@ -736,6 +759,9 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                 for t in tickers:
                     if t in active_positions:
                         continue
+                    is_dis, dis_reason = is_pair_disabled_today(t)
+                    if is_dis:
+                        continue
 
                     inst = meta_by_ticker[t]
                     figi = inst["figi"]
@@ -789,6 +815,17 @@ def run_tbank_bot(tickers: list, token: str, sandbox: bool, paper: bool,
                         continue
 
                     sweep_candle = df_ltf.iloc[swept_bar_idx]
+
+                    # Проверка фильтра тренда против бокового распила (Anti-Flat Filter)
+                    if getattr(cfg, "USE_TREND_FILTER", True):
+                        cand_meta = {
+                            "fvg_candle": sweep_candle.to_dict(),
+                            "confirm_time": last_sweep_time,
+                            "expected_dir": curr_bias,
+                        }
+                        trend_ok, trend_reason, _ = is_market_trending(df_htf, cand_meta, min_adx=getattr(cfg, "MIN_ADX_1H", 20.0))
+                        if not trend_ok:
+                            continue
 
                     # Проверка FVG
                     fvg_ltf = smc.fvg(df_ltf)

@@ -39,6 +39,8 @@ import config as cfg
 from strategy import resample, compute_bias_series, bias_at, in_killzone, get_next_killzone_delta
 from ict_advanced import compute_asian_ranges, is_asian_range_sweep
 from ai_evaluator import evaluate_setup
+from ai_circuit_breaker import is_pair_disabled_today, record_trade_and_check_circuit_breaker, evaluate_pre_trading_universe_ai
+from trend_filter import is_market_trending
 import telegram_notifier as tg
 import chart_generator as cg
 import pending_signals as ps
@@ -483,6 +485,7 @@ def reconcile_open_trades(exchange):
                 net_r=net_r,
                 total_fees=total_fee,
             )
+            record_trade_and_check_circuit_breaker(sym, outcome=exit_reason, r_net=net_r, exit_time=t["exit_time"])
             continue
 
         # ЭТАП 1: Достижение 1.0R (Частичная фиксация 50% + перенос стопа в BE)
@@ -586,6 +589,7 @@ def reconcile_open_trades(exchange):
                     net_r=net_r,
                     total_fees=total_fee,
                 )
+                record_trade_and_check_circuit_breaker(sym, outcome="STOP_LOSS", r_net=net_r, exit_time=t["exit_time"])
                 continue
 
         # ЭТАП 2: Позиция уже в безубытке (сопровождение остатка к 1.618R)
@@ -644,6 +648,7 @@ def reconcile_open_trades(exchange):
                     net_r=total_r,
                     total_fees=total_fee,
                 )
+                record_trade_and_check_circuit_breaker(sym, outcome=exit_reason, r_net=total_r, exit_time=t["exit_time"])
                 continue
 
     if updated:
@@ -990,6 +995,9 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
 
     now_utc_dt = datetime.now(timezone.utc)
     for sym in target_symbols:
+        is_dis, dis_reason = is_pair_disabled_today(sym)
+        if is_dis:
+            continue
         if any(t["symbol"] == sym for t in open_trades):
             continue
         if symbol_states.get(sym, {}).get("state") == "ARMED":
@@ -1054,6 +1062,17 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
                     continue
 
                 sweep_candle = df_closed.iloc[swept_bar_idx]
+
+                # Проверка фильтра тренда против бокового распила (Anti-Flat Filter)
+                if getattr(cfg, "USE_TREND_FILTER", True):
+                    cand_meta = {
+                        "fvg_candle": sweep_candle.to_dict(),
+                        "confirm_time": sweep_time,
+                        "expected_dir": expected_dir,
+                    }
+                    trend_ok, trend_reason, _ = is_market_trending(df_htf, cand_meta, min_adx=getattr(cfg, "MIN_ADX_1H", 20.0))
+                    if not trend_ok:
+                        continue
 
                 is_ar_sweep = False
                 ar_type = None
@@ -1146,6 +1165,13 @@ def check_armed_symbol_1m(exchange, sym, armed_data, seen, args, symbol_states):
     """
     Фаза 2 (ARMED): Ежеминутный снайперский поиск 1m FVG и его ретеста.
     """
+    is_dis, dis_reason = is_pair_disabled_today(sym)
+    if is_dis:
+        print(f"\n🛑 [{sym}] Пара отключена Circuit Breaker: {dis_reason}. Сброс в IDLE.\n")
+        symbol_states[sym]["state"] = "IDLE"
+        symbol_states[sym]["armed_data"] = None
+        return
+
     now_utc_dt = datetime.now(timezone.utc)
     if now_utc_dt >= armed_data["expires_at"]:
         print(f"\n⏰ [{sym}] Время ожидания входа (25 мин) истекло без теста FVG. Сброс в IDLE.\n")
@@ -1385,6 +1411,12 @@ def main():
         max_pos=args.max_pos if args.max_pos else 3,
     )
 
+    # 6. Пре-маркет ИИ-оценка рыночного режима по отслеживаемым инструментам
+    try:
+        evaluate_pre_trading_universe_ai(target_symbols, exchange=exchange, market="crypto", send_tg=True)
+    except Exception as e:
+        print(f"⚠️ Ошибка пре-маркет ИИ-оценки: {e}")
+
     seen = load_seen()
     symbol_states = {sym: {"state": "IDLE", "armed_data": None} for sym in target_symbols}
     last_5m_checked_bucket = None
@@ -1402,6 +1434,25 @@ def main():
             now_utc_dt = datetime.now(timezone.utc)
             now_utc = now_utc_dt.strftime("%H:%M:%S")
             now_epoch = time.time()
+
+            # Динамическая синхронизация корзины инструментов из data/active_universe.json
+            if args.alts:
+                try:
+                    u_file = getattr(cfg, "ACTIVE_UNIVERSE_FILE", "data/active_universe.json")
+                    if os.path.exists(u_file):
+                        with open(u_file, "r", encoding="utf-8") as _uf:
+                            _u_data = json.load(_uf)
+                        _crypto_syms = _u_data.get("crypto", [])
+                        if _crypto_syms:
+                            _new_targets = [s if s.endswith(":USDT") else f"{s}:USDT" for s in _crypto_syms]
+                            if set(_new_targets) != set(target_symbols):
+                                print(f"\n🔄 [Universe Update] Применена обновленная корзина из Telegram: {_new_targets}\n")
+                                target_symbols = _new_targets
+                                for _ns in target_symbols:
+                                    if _ns not in symbol_states:
+                                        symbol_states[_ns] = {"state": "IDLE", "armed_data": None}
+                except Exception:
+                    pass
 
             # 1. Проверяем открытые позиции (IN_TRADE: каждые 5 сек через быстрый fetch_ticker)
             trades = load_trades()

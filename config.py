@@ -15,7 +15,7 @@ DATA_SOURCE = "ccxt"
 CCXT_EXCHANGE = "binance"
 SYMBOL = "BTC/USDT"          # одиночный символ (для обратной совместимости)
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT", "ADA/USDT"]
-ALTS_SYMBOLS = ["BNB/USDT", "SOL/USDT", "DOGE/USDT", "ADA/USDT"]  # XRP исключен из-за структурной токсичности
+ALTS_SYMBOLS = ["XRP/USDT"]  # XRP исключен из-за структурной токсичности
 SWAP_SYMBOL = "BTC/USDT:USDT"  # для live-исполнения - бессрочный фьючерс (нужен для SHORT)
 SWAP_SYMBOLS = {
     "DOGE/USDT": "DOGE/USDT:USDT",
@@ -29,11 +29,18 @@ SWAP_SYMBOLS = {
 
 # Корзина с ультра-низким минимальным лотом (DOGE, ADA, BNB, SOL - без XRP)
 SMALL_ACCOUNT_SYMBOLS = [
-    "DOGE/USDT:USDT",
-    "ADA/USDT:USDT",
-    "BNB/USDT:USDT",
-    "SOL/USDT:USDT",
+    "XRP/USDT:USDT"
 ]
+
+# --- Пулы кандидатов для автоматического скринера Universe Screener ---
+CRYPTO_SCREENER_POOL = [
+    "DOGE/USDT", "ADA/USDT", "SUI/USDT", "NEAR/USDT", "AVAX/USDT",
+    "APT/USDT", "BNB/USDT", "SOL/USDT", "DOT/USDT", "TRX/USDT", "XRP/USDT"
+]
+MOEX_SCREENER_POOL = [
+    "SBER", "GAZP", "LKOH", "ROSN", "YDEX", "NVTK", "GMKN", "TATN", "CHMF", "PLZL", "MOEX", "ALRS"
+]
+
 
 # --- Каталоги данных, кэша и отчётов ---
 CACHE_DIR = "cache"
@@ -47,6 +54,7 @@ TBANK_TRADE_LOG_FILE = os.path.join(DATA_DIR, "tbank_trade_log.json")
 TBANK_SEEN_SIGNALS_FILE = os.path.join(DATA_DIR, "tbank_seen_signals.json")
 TBANK_ACTIVE_POSITIONS_FILE = os.path.join(DATA_DIR, "tbank_active_positions.json")
 PENDING_SIGNALS_FILE = os.path.join(DATA_DIR, "pending_signals.json")
+ACTIVE_UNIVERSE_FILE = os.path.join(DATA_DIR, "active_universe.json")
 
 # --- Google Gemini AI / Анализ и оценка сделок ---
 import os as _os
@@ -135,6 +143,8 @@ MIN_FVG_ZONE_PCT = 0.0005     # 0.05% (5 bps) оптимальный порог 
 MAX_FVG_ZONE_PCT = 0.006      # 0.60% фильтр аномально широких FVG
 MIN_ATR_5M_PCT = 0.0005       # 0.05% (5 bps) минимальный 5m ATR (защита от мертвого ночного распила, DD всего 4.1R)
 USE_VOLATILITY_FILTER = True  # True = блокировать сетапы при затухании рыночной волатильности
+USE_TREND_FILTER = True       # True = фильтр тренда против бокового распила (1H ADX >= 20 + Displacement)
+MIN_ADX_1H = 20.0             # минимальный 1H ADX для отсева мертвого флэта
 MIN_RISK_PCT = 0.0015        # фильтр аномально узкого стопа (0.15% отсекает шум, оставляя 73.8% WR сетапы)
 FEE_SLIPPAGE_PCT = 0.0008    # комиссия + проскальзывание на сделку
 STOP_BUFFER_PCT = 0.0015     # 0.15% буфер за свечу свипа (защита от микро-сквизов)
@@ -176,4 +186,94 @@ MIN_STRUCTURAL_R = 1.2          # минимальный потенциал хо
 
 # ---- Тайм-менеджмент Киллзон (Hold / Partial 80% / Close) ----
 KZ_EXIT_MODE = "hold"           # "hold" (тянуть) | "partial80" (сброс 80% риска в плюс) | "close" (100% дей-трейдинг)
+
+
+# ---- Динамическое управление вселенной активов (Universe Management) ----
+def update_active_symbols(market: str, symbols: list[str]) -> bool:
+    """
+    Обновляет активную торговую корзину в config.py и в data/active_universe.json.
+    market: 'crypto' или 'moex'
+    symbols: список тикеров, например ['DOGE/USDT', 'ADA/USDT', 'SUI/USDT', 'NEAR/USDT'] или ['SBER', 'GAZP', ...]
+    """
+    global ALTS_SYMBOLS, SMALL_ACCOUNT_SYMBOLS, SWAP_SYMBOLS, TBANK_TICKERS
+    import json
+    import re
+    if not symbols:
+        return False
+
+    clean_syms = [s.strip().upper() for s in symbols if s.strip()]
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # 1. Чтение существующего active_universe.json
+    universe_data = {}
+    if os.path.exists(ACTIVE_UNIVERSE_FILE):
+        try:
+            with open(ACTIVE_UNIVERSE_FILE, "r", encoding="utf-8") as f:
+                universe_data = json.load(f)
+        except Exception:
+            universe_data = {}
+
+    if market.lower() == "crypto":
+        ALTS_SYMBOLS = clean_syms
+        SMALL_ACCOUNT_SYMBOLS = [
+    "XRP/USDT:USDT"
+]
+        for s in clean_syms:
+            base = s.split(":")[0]
+            SWAP_SYMBOLS[base] = f"{base}:USDT"
+        universe_data["crypto"] = clean_syms
+    elif market.lower() == "moex":
+        TBANK_TICKERS = clean_syms
+        universe_data["moex"] = clean_syms
+    else:
+        return False
+
+    # 2. Сохраняем в data/active_universe.json
+    try:
+        with open(ACTIVE_UNIVERSE_FILE, "w", encoding="utf-8") as f:
+            json.dump(universe_data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Ошибка сохранения {ACTIVE_UNIVERSE_FILE}: {e}")
+
+    # 3. Обновляем config.py в файле для персистентности между перезапусками
+    try:
+        cfg_path = os.path.abspath(__file__)
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            code = f.read()
+
+        if market.lower() == "crypto":
+            syms_repr = json.dumps(clean_syms)
+            code = re.sub(r'ALTS_SYMBOLS\s*=\s*\[[^\]]*\]', f'ALTS_SYMBOLS = {syms_repr}', code)
+            small_repr = json.dumps([f"{s}:USDT" if not s.endswith(":USDT") else s for s in clean_syms], indent=4)
+            code = re.sub(r'SMALL_ACCOUNT_SYMBOLS\s*=\s*\[[^\]]*\]', f'SMALL_ACCOUNT_SYMBOLS = {small_repr}', code)
+        elif market.lower() == "moex":
+            syms_repr = json.dumps(clean_syms)
+            code = re.sub(r'TBANK_TICKERS\s*=\s*\[[^\]]*\]', f'TBANK_TICKERS = {syms_repr}', code)
+
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(code)
+    except Exception as e:
+        print(f"⚠️ Ошибка обновления config.py: {e}")
+
+    return True
+
+
+# Подгрузка активной корзины из data/active_universe.json при старте скрипта
+if os.path.exists(ACTIVE_UNIVERSE_FILE):
+    try:
+        import json as _json
+        with open(ACTIVE_UNIVERSE_FILE, "r", encoding="utf-8") as _f:
+            _universe = _json.load(_f)
+            if "crypto" in _universe and _universe["crypto"]:
+                ALTS_SYMBOLS = _universe["crypto"]
+                SMALL_ACCOUNT_SYMBOLS = [
+    "XRP/USDT:USDT"
+]
+                for _s in ALTS_SYMBOLS:
+                    _base = _s.split(":")[0]
+                    SWAP_SYMBOLS[_base] = f"{_base}:USDT"
+            if "moex" in _universe and _universe["moex"]:
+                TBANK_TICKERS = _universe["moex"]
+    except Exception:
+        pass
 

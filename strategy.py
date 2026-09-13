@@ -305,12 +305,15 @@ def find_candidates(df_htf, df_ltf, cfg, df_1m=None, smt_df=None):
                 if len(below):
                     structural_pool = float(below[-1])
 
+        fvg_candle = df_ltf.iloc[fvg_bar_pos].to_dict()
+
         seen_sweeps.add(sweep_time)
         candidates.append(dict(
             sweep_time=sweep_time, confirm_time=confirm_time, expected_dir=expected_dir,
             bias=bias, d1_bias=d1_val,
             fvg_top=float(fvg_top), fvg_bottom=float(fvg_bottom), fvg_ce=float(fvg_ce),
             zone_pct=float(zone_pct),
+            fvg_candle=fvg_candle,
             daily_atr=daily_atr, atr_5m=atr_5m, atr_pct=atr_pct, structural_pool=structural_pool,
             sweep_candle_high=float(sweep_candle["high"]), sweep_candle_low=float(sweep_candle["low"]),
             ob_candidate=ob_candidate,

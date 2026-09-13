@@ -16,6 +16,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
+import threading
 import ssl
 import time
 import json
@@ -30,6 +31,9 @@ from datetime import datetime, timezone, timedelta
 import config as cfg
 from telegram_notifier import get_telegram_credentials
 import pending_signals as ps
+
+# Хранилище временного состояния выбора инструментов для инлайн-чекбоксов
+_user_manual_selections = {}
 
 DATA_DIR = getattr(cfg, "DATA_DIR", "data")
 BITGET_TRADES_PATH = getattr(cfg, "TRADE_LOG_FILE", os.path.join(DATA_DIR, "live_trade_log.json"))
@@ -103,6 +107,7 @@ def get_main_keyboard():
         "keyboard": [
             [{"text": "📊 Статистика"}, {"text": "📌 Позиции"}],
             [{"text": "💰 Баланс"}, {"text": "🕒 Статус сессий"}],
+            [{"text": "🔍 Скринер"}, {"text": "🧠 ИИ-Анализ"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -351,7 +356,9 @@ def format_help_message() -> str:
         "🤖 <b>ICT TOOLKIT: КОМАНДЫ БОТА</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "Используйте кнопки на клавиатуре внизу или команды:\n\n"
+        "🔍 <b>/screen</b> — Автоматический квант-скринер активов с кнопками выбора и применения\n"
         "📊 <b>/stats</b> — Полная статистика сделок, винрейт, Net PnL, Net R и комиссии биржи\n"
+        "🧠 <b>/ai</b> — Институциональный ИИ-аудит открытых позиций и здоровья активной корзины\n"
         "📌 <b>/positions</b> — Все текущие открытые позиции с ценами входа, SL, TP и сетапом\n"
         "💰 <b>/balance</b> — Баланс USDT на Bitget и рублей на счете Т-Банка\n"
         "🕒 <b>/status</b> — Текущая торговая сессия (Asia/London/NY) и расписание биржи\n"
@@ -361,6 +368,25 @@ def format_help_message() -> str:
     )
 
 
+def get_ai_portfolio_report_and_keyboard() -> tuple[str, dict]:
+    """Запрашивает полный институциональный ИИ-аудит открытых позиций и активной корзины."""
+    from ai_circuit_breaker import evaluate_portfolio_and_positions_ai
+    try:
+        report_text, _ = evaluate_portfolio_and_positions_ai(send_tg=False)
+        kb = {
+            "inline_keyboard": [
+                [{"text": "🔄 Обновить ИИ-Анализ", "callback_data": "ai:refresh"}],
+                [
+                    {"text": "📌 Открытые позиции", "callback_data": "pos:view"},
+                    {"text": "🔍 Скринер", "callback_data": "screen:run:crypto"},
+                ],
+            ]
+        }
+        return report_text, kb
+    except Exception as e:
+        return f"⚠️ <b>Ошибка выполнения ИИ-аудита:</b>\n<code>{html.escape(str(e))}</code>", get_main_keyboard()
+
+
 def handle_command(text: str) -> tuple[str, dict]:
     """Обрабатывает входящую текстовую команду и возвращает ответ с кнопками."""
     cmd = text.strip().lower()
@@ -368,6 +394,15 @@ def handle_command(text: str) -> tuple[str, dict]:
 
     if cmd in ("/start", "/help", "помощь", "❓ помощь", "help"):
         return format_help_message(), keyboard
+    elif cmd in ("/screen", "/screener", "скринер", "🔍 скринер", "screen"):
+        return get_screener_report_or_menu("crypto")
+    elif cmd in ("/screen_crypto", "screen crypto"):
+        return get_screener_report_or_menu("crypto")
+    elif cmd in ("/screen_moex", "screen moex"):
+        return get_screener_report_or_menu("moex")
+    elif cmd in ("/ai", "/ai_portfolio", "/ai_positions", "/ai_review", "/audit",
+                 "ии", "🧠 ии-анализ", "🧠 ии-оценка", "ии-анализ", "ии анализ", "ии портфель", "ai", "портфель", "оценка"):
+        return get_ai_portfolio_report_and_keyboard()
     elif cmd in ("/stats", "статистика", "📊 статистика", "stats"):
         return format_stats_report(), keyboard
     elif cmd in ("/positions", "позиции", "📌 позиции", "pos"):
@@ -379,7 +414,7 @@ def handle_command(text: str) -> tuple[str, dict]:
     else:
         return (
             f"Неизвестная команда: <code>{html.escape(text)}</code>\n\n"
-            f"Используйте кнопки внизу экрана или введите /stats, /positions, /balance, /status",
+            f"Используйте кнопки внизу экрана или введите /screen, /ai, /stats, /positions, /balance, /status",
             keyboard,
         )
 
@@ -426,9 +461,76 @@ def edit_message_caption(message_id: int, new_caption: str, reply_markup: dict =
         print(f"⚠️ Ошибка editMessageCaption: {e}")
 
 
+def edit_message_text(message_id: int, new_text: str, reply_markup: dict = None):
+    """Обновляет текст текстового сообщения и его инлайн-кнопки."""
+    token, chat_id, proxy, base_url = get_telegram_credentials()
+    url = f"{base_url}/bot{token}/editMessageText"
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": new_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    try:
+        requests.post(url, json=payload, proxies=proxies, verify=False, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Ошибка editMessageText: {e}")
+
+
+def get_screener_report_or_menu(market: str = "crypto") -> tuple[str, dict]:
+    """Возвращает последний отчет скринера или меню запуска с кнопками."""
+    reports_dir = getattr(cfg, "REPORTS_DIR", "reports")
+    json_path = os.path.join(reports_dir, f"screener_{market}_latest.json")
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+            from universe_screener import format_screener_telegram_message
+            return format_screener_telegram_message(report)
+        except Exception as e:
+            print(f"⚠️ Ошибка чтения {json_path}: {e}")
+
+    is_crypto = market == "crypto"
+    m_name = "Криптовалют (Bitget)" if is_crypto else "Мосбиржи (Т-Банк)"
+    text = (
+        f"🔍 <b>СКРИНЕР АКТИВОВ: {m_name.upper()}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Свежий отчет по 90-дневному тесту Grid B еще не сформирован.\n\n"
+        f"Нажмите кнопку ниже для запуска автоматического квант-скрининга:"
+    )
+    kb = {
+        "inline_keyboard": [
+            [{"text": f"🚀 Запустить скрининг {m_name} (90д)", "callback_data": f"screen:run:{market}"}],
+            [
+                {"text": "⚡ Крипта (90д)", "callback_data": "screen:run:crypto"},
+                {"text": "🇷🇺 Мосбиржа (90д)", "callback_data": "screen:run:moex"},
+            ],
+        ]
+    }
+    return text, kb
+
+
+def _run_screener_background(market: str, msg_id: int):
+    """Фоновый поток для выполнения скрининга без блокировки Telegram polling."""
+    try:
+        from universe_screener import run_screener, format_screener_telegram_message
+        report = run_screener(market=market, days=90)
+        text, reply_markup = format_screener_telegram_message(report)
+        edit_message_text(msg_id, text, reply_markup=reply_markup)
+    except Exception as e:
+        print(f"❌ Ошибка в _run_screener_background: {e}")
+        edit_message_text(msg_id, f"❌ <b>Ошибка скрининга {market.upper()}:</b>\n<code>{html.escape(str(e))}</code>")
+
+
 def handle_callback_query(cb_id: str, data: str, msg_id: int, orig_caption: str):
-    """Обрабатывает нажатия инлайн-кнопок подтверждения или отклонения сделки."""
+    """Обрабатывает нажатия инлайн-кнопок подтверждения, отклонения и управления скринером."""
+    global _user_manual_selections
     print(f"🔘 Нажата инлайн-кнопка: '{data}' (Msg ID: {msg_id})")
+
     if data.startswith("confirm:"):
         sig_id = data.split(":", 1)[1]
         ok = ps.approve_signal(sig_id)
@@ -455,6 +557,142 @@ def handle_callback_query(cb_id: str, data: str, msg_id: int, orig_caption: str)
         )
         if msg_id:
             edit_message_caption(msg_id, new_caption)
+
+    elif data.startswith("screen:run:"):
+        market = data.split(":", 2)[2]
+        answer_callback_query(cb_id, f"⏳ Запуск скрининга {market.upper()}...")
+        m_name = "Криптовалют" if market == "crypto" else "Мосбиржи"
+        loading_text = (
+            f"⏳ <b>ИДЕТ СКРИНИНГ РЫНКА: {m_name.upper()} (90 ДНЕЙ)...</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Загрузка истории и симуляция институционального профиля Grid B.\n"
+            f"Пожалуйста, подождите ~30-60 сек. Результаты появятся здесь автоматически...</i>"
+        )
+        edit_message_text(msg_id, loading_text, reply_markup={"inline_keyboard": []})
+        threading.Thread(target=_run_screener_background, args=(market, msg_id), daemon=True).start()
+
+    elif data.startswith("screen:apply:"):
+        market = data.split(":", 2)[2]
+        reports_dir = getattr(cfg, "REPORTS_DIR", "reports")
+        json_path = os.path.join(reports_dir, f"screener_{market}_latest.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    rep = json.load(f)
+                rec_syms = rep.get("recommended_symbols", [])
+                if rec_syms:
+                    ok = cfg.update_active_symbols(market, rec_syms)
+                    if ok:
+                        m_title = "Крипты" if market == "crypto" else "Мосбиржи"
+                        answer_callback_query(cb_id, f"✅ Корзина {m_title} обновлена!")
+                        applied_text = (
+                            f"✅ <b>КОРЗИНА {m_title.upper()} УСПЕШНО ПРИМЕНЕНА!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"Активные инструменты ({len(rec_syms)}):\n"
+                            f"<code>{', '.join(rec_syms)}</code>\n\n"
+                            f"<i>Параметры сохранены в config.py и мгновенно активированы для робота.</i>"
+                        )
+                        edit_message_text(msg_id, applied_text, reply_markup={"inline_keyboard": [
+                            [{"text": "🔙 К лидерборду скринера", "callback_data": f"screen:back:{market}"}],
+                            [{"text": "📊 Статистика", "callback_data": "sample_stats"}],
+                        ]})
+                    else:
+                        answer_callback_query(cb_id, "❌ Ошибка записи в config.py")
+                else:
+                    answer_callback_query(cb_id, "⚠️ Нет рекомендованных инструментов в отчете.")
+            except Exception as e:
+                answer_callback_query(cb_id, f"Ошибка: {e}")
+        else:
+            answer_callback_query(cb_id, "⚠️ Отчет скринера не найден. Запустите скрининг заново.")
+
+    elif data.startswith("screen:manual:"):
+        market = data.split(":", 2)[2]
+        from universe_screener import format_manual_selection_keyboard
+        if market == "crypto":
+            cur_selected = list(getattr(cfg, "ALTS_SYMBOLS", ["DOGE/USDT", "ADA/USDT", "BNB/USDT", "SOL/USDT"]))
+            all_pool = list(getattr(cfg, "CRYPTO_SCREENER_POOL", []))
+        else:
+            cur_selected = list(getattr(cfg, "TBANK_TICKERS", ["SBER", "GAZP", "LKOH", "ROSN", "YDEX"]))
+            all_pool = list(getattr(cfg, "MOEX_SCREENER_POOL", []))
+
+        _user_manual_selections[market] = set(cur_selected)
+        text, reply_markup = format_manual_selection_keyboard(market, sorted(list(_user_manual_selections[market])), all_pool)
+        answer_callback_query(cb_id, "📋 Меню выбора")
+        edit_message_text(msg_id, text, reply_markup=reply_markup)
+
+    elif data.startswith("screen:toggle:"):
+        parts = data.split(":")
+        market = parts[2]
+        sym = parts[3]
+        all_pool = list(getattr(cfg, "CRYPTO_SCREENER_POOL", [])) if market == "crypto" else list(getattr(cfg, "MOEX_SCREENER_POOL", []))
+        if market not in _user_manual_selections:
+            cur = getattr(cfg, "ALTS_SYMBOLS", []) if market == "crypto" else getattr(cfg, "TBANK_TICKERS", [])
+            _user_manual_selections[market] = set(cur)
+
+        if sym in _user_manual_selections[market]:
+            _user_manual_selections[market].remove(sym)
+            short_s = sym.replace("/USDT", "")
+            answer_callback_query(cb_id, f"Исключен {short_s}")
+        else:
+            _user_manual_selections[market].add(sym)
+            short_s = sym.replace("/USDT", "")
+            answer_callback_query(cb_id, f"Добавлен {short_s}")
+
+        from universe_screener import format_manual_selection_keyboard
+        text, reply_markup = format_manual_selection_keyboard(market, sorted(list(_user_manual_selections[market])), all_pool)
+        edit_message_text(msg_id, text, reply_markup=reply_markup)
+
+    elif data.startswith("screen:save:"):
+        market = data.split(":", 2)[2]
+        sel_list = sorted(list(_user_manual_selections.get(market, [])))
+        if not sel_list:
+            answer_callback_query(cb_id, "⚠️ Выберите хотя бы 1 инструмент!")
+            return
+        ok = cfg.update_active_symbols(market, sel_list)
+        if ok:
+            m_title = "Крипты" if market == "crypto" else "Мосбиржи"
+            answer_callback_query(cb_id, f"✅ Сохранено {len(sel_list)} инструментов!")
+            save_text = (
+                f"✅ <b>КОРЗИНА {m_title.upper()} СОХРАНЕНА!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Выбранные активные инструменты ({len(sel_list)}):\n"
+                f"<code>{', '.join(sel_list)}</code>\n\n"
+                f"<i>Параметры сохранены в config.py и активны для бота.</i>"
+            )
+            edit_message_text(msg_id, save_text, reply_markup={"inline_keyboard": [
+                [{"text": "🔙 К лидерборду скринера", "callback_data": f"screen:back:{market}"}],
+                [{"text": "📊 Статистика", "callback_data": "sample_stats"}],
+            ]})
+        else:
+            answer_callback_query(cb_id, "❌ Ошибка сохранения в config.py")
+
+    elif data.startswith("screen:back:"):
+        market = data.split(":", 2)[2]
+        answer_callback_query(cb_id, "Лидерборд")
+        text, reply_markup = get_screener_report_or_menu(market)
+        edit_message_text(msg_id, text, reply_markup=reply_markup)
+
+    elif data == "ai:refresh":
+        answer_callback_query(cb_id, "⏳ Обновление ИИ-аудита...")
+        loading_text = (
+            "⏳ <b>ИДЕТ ИИ-АУДИТ ПОЗИЦИЙ И КОРЗИНЫ...</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Запрос в Google Gemini 3.6 Flash и расчет квант-метрик (1H ADX, PnL, floating R)...\n"
+            "Пожалуйста, подождите ~5-10 сек...</i>"
+        )
+        edit_message_text(msg_id, loading_text, reply_markup={"inline_keyboard": []})
+        def _run_ai_refresh():
+            text, kb = get_ai_portfolio_report_and_keyboard()
+            edit_message_text(msg_id, text, reply_markup=kb)
+        threading.Thread(target=_run_ai_refresh, daemon=True).start()
+
+    elif data == "pos:view":
+        answer_callback_query(cb_id, "Открытые позиции")
+        pos_text = format_positions_report()
+        edit_message_text(msg_id, pos_text, reply_markup={"inline_keyboard": [
+            [{"text": "🧠 ИИ-Анализ позиций", "callback_data": "ai:refresh"}],
+            [{"text": "📊 Статистика", "callback_data": "sample_stats"}],
+        ]})
 
     elif data.startswith("sample_"):
         answer_callback_query(cb_id, "Это демонстрация кнопок.")
@@ -511,7 +749,7 @@ def run_bot_listener():
                                 user_id = str(cb.get("from", {}).get("id", ""))
                                 cb_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
                                 msg_id = cb.get("message", {}).get("message_id")
-                                orig_caption = cb.get("message", {}).get("caption", "")
+                                orig_caption = cb.get("message", {}).get("caption", "") or cb.get("message", {}).get("text", "")
 
                                 if user_id == chat_id or cb_chat_id == chat_id:
                                     handle_callback_query(cb_id, cb_data, msg_id, orig_caption)
