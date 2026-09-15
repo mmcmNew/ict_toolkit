@@ -1,0 +1,15 @@
+trades,wins,losses,winrate,total_r,avg_r,profit_factor,max_dd_r,recovery_ratio,score,long_trades,short_trades,experiment
+210,107,103,51.0,-30.78,-0.147,0.74,30.72,0.0,0.0,131,79,"0. Baseline Benchmark (Old Stop, CE, Grid B 1.0/1.618, 24/7)"
+264,139,125,52.7,-22.93,-0.087,0.84,23.67,0.0,0.0,164,100,"1. True Structural Stop (CE, Grid B, 24/7)"
+328,191,137,58.2,14.03,0.043,1.09,14.92,0.94,1.19,207,121,"2. True Stop + Edge Entry (Grid B, 24/7)"
+264,129,135,48.9,-12.22,-0.046,0.92,20.45,0.0,0.0,164,100,"3. True Stop + Grid A (1.2R / 2.0R, 24/7)"
+264,117,147,44.3,-1.45,-0.005,0.99,23.17,0.0,0.0,164,100,4. True Stop + Grid 1.5R / 2.5R (24/7)
+264,117,147,44.3,-10.12,-0.038,0.94,20.18,0.0,0.0,164,100,5. True Stop + Single 1.5R TP (100% exit)
+115,51,64,44.3,-30.32,-0.264,0.58,30.32,0.0,0.0,71,44,6. True Stop + Asian Range (Grid B)
+167,93,74,55.7,-8.37,-0.05,0.9,17.58,0.0,0.0,98,69,"7. True Stop + Trend Filter ADX>=20 (Grid B, 24/7)"
+119,67,52,56.3,-3.42,-0.029,0.94,14.3,0.0,0.0,75,44,"8. True Stop + Trend Filter ADX>=25 (Grid B, 24/7)"
+264,139,125,52.7,-14.03,-0.053,0.9,18.81,0.0,0.0,164,100,9. True Stop + Grid B + BE Buffer -0.2R (24/7)
+123,73,50,59.3,7.61,0.062,1.13,8.21,0.93,1.25,80,43,"10. Top Performers (SOL, XRP, BTC, ETH) - True Stop + Grid B"
+79,50,29,63.3,8.54,0.108,1.25,5.26,1.62,2.57,51,28,"11. Top Performers (SOL, XRP, BTC, ETH) - True Stop + Trend Filter"
+59,39,20,66.1,6.52,0.11,1.28,5.1,1.28,2.16,38,21,"12. Top Performers (SOL, XRP, BTC) - True Stop + Trend Filter"
+59,35,24,59.3,8.03,0.136,1.29,5.76,1.39,2.12,38,21,"13. Top Performers (SOL, XRP, BTC) - True Stop + Grid A (1.2R/2.0R)"

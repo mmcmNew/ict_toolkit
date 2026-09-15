@@ -106,8 +106,9 @@ def get_main_keyboard():
     return {
         "keyboard": [
             [{"text": "📊 Статистика"}, {"text": "📌 Позиции"}],
-            [{"text": "💰 Баланс"}, {"text": "🕒 Статус сессий"}],
-            [{"text": "🔍 Скринер"}, {"text": "🧠 ИИ-Анализ"}],
+            [{"text": "💰 Баланс"}, {"text": "⚡ Статус и Режим"}],
+            [{"text": "🗺️ Уровни ликвидности"}, {"text": "🔍 Скринер"}],
+            [{"text": "🧠 ИИ-Аудит портфеля"}, {"text": "❓ Помощь"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -306,48 +307,27 @@ def format_balance_report() -> str:
 
 
 def format_status_report() -> str:
-    """Формирует отчет о сессиях, расписании и статусе работы."""
-    now_utc = datetime.now(timezone.utc)
-    now_msk = now_utc + timedelta(hours=3)
+    """Формирует отчет о сессиях, расписании, активных режимах охоты и статусе работы."""
+    try:
+        from liquidity_sentry import format_bot_status_telegram
+        return format_bot_status_telegram()
+    except Exception as e:
+        return f"⚠️ <b>Ошибка формирования статуса:</b>\n<code>{html.escape(str(e))}</code>"
 
-    # Определение сессии
-    hour_utc = now_utc.hour
-    if 0 <= hour_utc < 6:
-        session_name = "🌏 Asian Session (Азиатская сессия)"
-    elif 7 <= hour_utc <= 10:
-        session_name = "🇬🇧 London Killzone (Лондонское окно)"
-    elif 12 <= hour_utc <= 15:
-        session_name = "🇺🇸 New York Killzone (Нью-Йоркское окно)"
-    else:
-        session_name = "🌐 Вне основных Киллзон (Межсессионный мониторинг)"
 
-    # Статус Мосбиржи
-    is_weekend = now_msk.weekday() >= 5
-    m_min = now_msk.hour * 60 + now_msk.minute
-    moex_open = False
-    if not is_weekend:
-        if (10 * 60 <= m_min <= 18 * 60 + 40) or (19 * 60 + 5 <= m_min <= 23 * 60 + 50):
-            moex_open = True
-
-    moex_status = "🟢 Торги идут (Открыта)" if moex_open else "🔴 Торги закрыты"
-
-    lines = [
-        "🕒 <b>СТАТУС СЕССИЙ И РАСПИСАНИЕ БИРЖ</b>",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"⏱ <b>Время MSK:</b> <code>{now_msk.strftime('%Y-%m-%d %H:%M:%S')}</code>",
-        f"⏱ <b>Время UTC:</b> <code>{now_utc.strftime('%H:%M:%S')}</code>",
-        "",
-        f"🎯 <b>Текущая сессия:</b> {session_name}",
-        f"🏛 <b>Мосбиржа (MOEX):</b> {moex_status}",
-        "  • <i>Основная сессия: 10:00 — 18:40 МСК</i>",
-        "  • <i>Вечерняя сессия: 19:05 — 23:50 МСК</i>",
-        "",
-        "🤖 <b>Фоновые демоны торговли:</b>",
-        "  • Bitget Crypto: 🟢 <b>Активен</b> (5 пар, Asian Range, риск 1.0%)",
-        "  • T-Bank MOEX:   🟢 <b>Активен</b> (SBER, ROSN, T, GAZP, риск 1.0%)",
-        "━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    return "\n".join(lines)
+def get_status_report_and_keyboard() -> tuple[str, dict]:
+    """Возвращает актуальный отчет о статусе ботов (режимы Охоты, Дозора, сессии) и инлайн-клавиатуру."""
+    text = format_status_report()
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🔄 Обновить статус", "callback_data": "status:refresh"}],
+            [
+                {"text": "🗺️ Уровни (Bitget)", "callback_data": "levels:crypto"},
+                {"text": "🇷🇺 Уровни (Мосбиржа)", "callback_data": "levels:moex"},
+            ],
+        ]
+    }
+    return text, kb
 
 
 def format_help_message() -> str:
@@ -355,17 +335,36 @@ def format_help_message() -> str:
     return (
         "🤖 <b>ICT TOOLKIT: КОМАНДЫ БОТА</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "Используйте кнопки на клавиатуре внизу или команды:\n\n"
-        "🔍 <b>/screen</b> — Автоматический квант-скринер активов с кнопками выбора и применения\n"
-        "📊 <b>/stats</b> — Полная статистика сделок, винрейт, Net PnL, Net R и комиссии биржи\n"
-        "🧠 <b>/ai</b> — Институциональный ИИ-аудит открытых позиций и здоровья активной корзины\n"
+        "Используйте кнопки меню внизу экрана или команды:\n\n"
+        "⚡ <b>/status</b> (или /state) — Живое состояние ботов, режим Охоты за FVG, таймеры и сессии\n"
+        "🗺️ <b>/levels</b> — Карта уровней ликвидности (Sentry) с расстояниями в % до пулов\n"
         "📌 <b>/positions</b> — Все текущие открытые позиции с ценами входа, SL, TP и сетапом\n"
+        "📊 <b>/stats</b> — Полная статистика сделок, винрейт, Net PnL, Net R и комиссии биржи\n"
         "💰 <b>/balance</b> — Баланс USDT на Bitget и рублей на счете Т-Банка\n"
-        "🕒 <b>/status</b> — Текущая торговая сессия (Asia/London/NY) и расписание биржи\n"
+        "🔍 <b>/screen</b> — Автоматический квант-скринер активов с кнопками выбора и применения\n"
+        "🧠 <b>/ai</b> — Институциональный ИИ-аудит открытых позиций и здоровья активной корзины\n"
         "❓ <b>/help</b> — Показать это справочное сообщение\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Уведомления о сделках, тейках 1.5R и марже приходят автоматически!</i>"
+        "<i>Уведомления о сделках, свипах ликвидности и тейках приходят автоматически!</i>"
     )
+
+
+def get_levels_report_and_keyboard(market: str = "crypto") -> tuple[str, dict]:
+    """Возвращает отчет по карте уровней ликвидности и инлайн-клавиатуру выбора рынка."""
+    from liquidity_sentry import load_liquidity_map, format_liquidity_map_telegram
+    data = load_liquidity_map()
+    market_data = data.get("markets", {}).get(market, {})
+    text = format_liquidity_map_telegram(market_data, market_name=market)
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": "⚡ Крипта (Bitget)" if market != "crypto" else "⚡ Крипта (Выбрано)", "callback_data": "levels:crypto"},
+                {"text": "🇷🇺 Мосбиржа" if market != "moex" else "🇷🇺 Мосбиржа (Выбрано)", "callback_data": "levels:moex"},
+            ],
+            [{"text": "🔄 Обновить уровни", "callback_data": f"levels:{market}"}],
+        ]
+    }
+    return text, kb
 
 
 def get_ai_portfolio_report_and_keyboard() -> tuple[str, dict]:
@@ -391,14 +390,42 @@ def handle_command(text: str) -> tuple[str, dict]:
     """Обрабатывает входящую текстовую команду и возвращает ответ с кнопками."""
     keyboard = get_main_keyboard()
     clean_text = "".join(ch for ch in text if ch.isalnum() or ch in " /-_").strip().lower()
+    words = set(clean_text.split())
 
+    # 1. Помощь / Старт
     if any(k in clean_text for k in ("помощ", "help", "start")):
         return format_help_message(), keyboard
+
+    # 2. Открытые позиции (проверяем СТРОГО ДО ИИ, чтобы слово 'позиции' не цепляло подстроку 'ии')
+    elif any(k in clean_text for k in ("позици", "orders", "сделк")) or "pos" in words or "positions" in words:
+        return format_positions_report(), keyboard
+
+    # 3. Статистика
+    elif any(k in clean_text for k in ("статистик", "stat")):
+        return format_stats_report(), keyboard
+
+    # 4. Баланс
+    elif any(k in clean_text for k in ("баланс", "bal", "депозит")):
+        return format_balance_report(), keyboard
+
+    # 5. Живой статус ботов, режим охоты, сессии
+    elif any(k in clean_text for k in ("статус", "режим", "охот", "сесси", "state")) or "status" in words:
+        return get_status_report_and_keyboard()
+
+    # 6. Уровни ликвидности (Sentry)
+    elif any(k in clean_text for k in ("уровн", "sentry", "ликвидн")) or "levels" in words or "level" in words:
+        if "moex" in clean_text or "мосбирж" in clean_text:
+            return get_levels_report_and_keyboard("moex")
+        return get_levels_report_and_keyboard("crypto")
+
+    # 7. Скринер
     elif any(k in clean_text for k in ("скрин", "screen")):
         if "moex" in clean_text or "мосбирж" in clean_text:
             return get_screener_report_or_menu("moex")
         return get_screener_report_or_menu("crypto")
-    elif any(k in clean_text for k in ("ии", "ai", "анализ", "audit", "портфел", "оценк")):
+
+    # 8. Институциональный ИИ-Аудит портфеля (строго изолированные токены 'ии' или 'ai', либо слова 'аудит', 'нейро', 'портфел')
+    elif "ии" in words or "ai" in words or any(k in clean_text for k in ("аудит", "нейро", "портфел")):
         def _run_ai_audit_async():
             try:
                 from ai_circuit_breaker import evaluate_portfolio_and_positions_ai
@@ -423,18 +450,18 @@ def handle_command(text: str) -> tuple[str, dict]:
             "Сводка поступит через ~3-5 секунд...</i>",
             keyboard,
         )
-    elif any(k in clean_text for k in ("статистик", "stat")):
-        return format_stats_report(), keyboard
-    elif any(k in clean_text for k in ("позици", "pos")):
-        return format_positions_report(), keyboard
-    elif any(k in clean_text for k in ("баланс", "bal")):
-        return format_balance_report(), keyboard
-    elif any(k in clean_text for k in ("статус", "сесси", "status")):
-        return format_status_report(), keyboard
+
     else:
         return (
             f"Неизвестная команда: <code>{html.escape(text)}</code>\n\n"
-            f"Используйте кнопки внизу экрана или введите /screen, /ai, /stats, /positions, /balance, /status",
+            f"Используйте кнопки меню внизу экрана или команды:\n"
+            f"⚡ /status — Живое состояние ботов и режим Охоты\n"
+            f"🗺️ /levels — Карта уровней ликвидности\n"
+            f"📌 /positions — Активные открытые позиции\n"
+            f"📊 /stats — Сводная статистика торговли\n"
+            f"💰 /balance — Балансы счетов\n"
+            f"🔍 /screen — Скринер инструментов\n"
+            f"🧠 /ai — ИИ-аудит портфеля",
             keyboard,
         )
 
@@ -713,6 +740,17 @@ def handle_callback_query(cb_id: str, data: str, msg_id: int, orig_caption: str)
             [{"text": "🧠 ИИ-Анализ позиций", "callback_data": "ai:refresh"}],
             [{"text": "📊 Статистика", "callback_data": "sample_stats"}],
         ]})
+
+    elif data.startswith("levels:"):
+        market = data.split(":", 1)[1] if ":" in data else "crypto"
+        answer_callback_query(cb_id, f"Уровни {market.upper()}")
+        text, kb = get_levels_report_and_keyboard(market)
+        edit_message_text(msg_id, text, reply_markup=kb)
+
+    elif data == "status:refresh":
+        answer_callback_query(cb_id, "🔄 Обновляю статус ботов...")
+        text, kb = get_status_report_and_keyboard()
+        edit_message_text(msg_id, text, reply_markup=kb)
 
     elif data.startswith("sample_"):
         answer_callback_query(cb_id, "Это демонстрация кнопок.")

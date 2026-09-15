@@ -13,23 +13,24 @@ DATA_SOURCE = "ccxt"
 
 # --- ccxt (крипта) ---
 CCXT_EXCHANGE = "binance"
-SYMBOL = "BTC/USDT"          # одиночный символ (для обратной совместимости)
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT", "ADA/USDT"]
-ALTS_SYMBOLS = ["XRP/USDT"]  # XRP исключен из-за структурной токсичности
-SWAP_SYMBOL = "BTC/USDT:USDT"  # для live-исполнения - бессрочный фьючерс (нужен для SHORT)
+SYMBOL = "SOL/USDT"          # одиночный символ (для обратной совместимости)
+SYMBOLS = ["SOL/USDT", "XRP/USDT", "BTC/USDT", "ETH/USDT"]
+ALTS_SYMBOLS = ["SOL/USDT", "XRP/USDT", "ETH/USDT"]  # проверенная корзина с подтвержденным edge
+SWAP_SYMBOL = "SOL/USDT:USDT"  # для live-исполнения - бессрочный фьючерс (нужен для SHORT)
 SWAP_SYMBOLS = {
-    "DOGE/USDT": "DOGE/USDT:USDT",
-    "ADA/USDT": "ADA/USDT:USDT",
     "XRP/USDT": "XRP/USDT:USDT",
-    "BNB/USDT": "BNB/USDT:USDT",
     "SOL/USDT": "SOL/USDT:USDT",
     "BTC/USDT": "BTC/USDT:USDT",
     "ETH/USDT": "ETH/USDT:USDT",
+    "BNB/USDT": "BNB/USDT:USDT",
+    "DOGE/USDT": "DOGE/USDT:USDT",
+    "ADA/USDT": "ADA/USDT:USDT",
 }
 
-# Корзина с ультра-низким минимальным лотом (DOGE, ADA, BNB, SOL - без XRP)
+# Корзина с ультра-низким минимальным лотом и подтвержденным положительным edge
 SMALL_ACCOUNT_SYMBOLS = [
-    "XRP/USDT:USDT"
+    "XRP/USDT:USDT",
+    "SOL/USDT:USDT"
 ]
 
 # --- Пулы кандидатов для автоматического скринера Universe Screener ---
@@ -59,9 +60,14 @@ ACTIVE_UNIVERSE_FILE = os.path.join(DATA_DIR, "active_universe.json")
 # --- Google Gemini AI / Анализ и оценка сделок ---
 import os as _os
 GEMINI_API_KEY = _os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = _os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")  # стабильная быстрая модель
-ENABLE_AI_EVALUATION = False       # включить оценку перед входом в сделку (или через флаг --ai)
+GEMINI_MODEL = _os.environ.get("GEMINI_MODEL", "gemini-flash-latest")  # быстрая и стабильная модель
+ENABLE_AI_EVALUATION = True        # включить оценку перед входом в сделку через Gemini AI
 AI_CONFIDENCE_THRESHOLD = 7        # минимальный балл (1-10) для одобрения сделки ИИ
+
+# --- Двухфазный Liquidity Sentry (Passive Sentry -> Active Hunt) ---
+USE_LIQUIDITY_SENTRY = True        # предварительный расчет уровней ликвидности и триггерные алерты
+HUNT_TIMEOUT_MINUTES = 60          # максимальное время охоты за FVG после свипа уровня (мин)
+SENTRY_POLL_INTERVAL_SEC = 5       # частота легкого опроса цен тикера для триггера свипа
 
 # --- Live-торговля (Bitget крипто-фьючерсы) ---
 BITGET_API_KEY = _os.environ.get("BITGET_API_KEY", "")
@@ -92,9 +98,10 @@ TBANK_CLASS_CODE = "TQBR"  # TQBR - акции РФ, SPBFUT - фьючерсы
 TBANK_FIGI = _os.environ.get("TBANK_FIGI", "BBG004730N88")  # SBER (если пусто - резолвится по тикеру)
 TBANK_COMMISSION_PCT = 0.0005  # базовая комиссия брокера + биржи (~0.05%)
 TBANK_MAX_POSITIONS = 5       # макс. число открытых позиций в корзине акций РФ
-TBANK_PARTIAL_TAKE_R = float(_os.environ.get("TBANK_PARTIAL_TAKE_R", "2.5"))   # Тейк 2.5R для акций РФ (+107.6R, PF 2.46 на тестах)
+TBANK_PARTIAL_TAKE_R = float(_os.environ.get("TBANK_PARTIAL_TAKE_R", "1.0"))   # Сетка B: TP1 на 1.0R (фиксация 50% + True BE)
+TBANK_RUNNER_TAKE_R = float(_os.environ.get("TBANK_RUNNER_TAKE_R", "1.618")) # Сетка B: TP2 на 1.618R (Golden Ratio)
 TBANK_TRAIL_DISTANCE_R = float(_os.environ.get("TBANK_TRAIL_DISTANCE_R", "0.8")) # трейлинг-стоп остатка 0.8R
-TBANK_PARTIAL_TAKE_SIZE = float(_os.environ.get("TBANK_PARTIAL_TAKE_SIZE", "0.5")) # фиксация 50% объема на 2.5R
+TBANK_PARTIAL_TAKE_SIZE = float(_os.environ.get("TBANK_PARTIAL_TAKE_SIZE", "0.5")) # фиксация 50% объема на 1.0R
 MOEX_EXCLUDE_DAYS = ["Thursday"]  # Четверг исключен на Мосбирже (день экспираций FORTS, убыток -6.28R)
 SSL_TBANK_VERIFY = _os.environ.get("SSL_TBANK_VERIFY", "True").lower() in ("true", "1", "yes")
 
@@ -116,10 +123,22 @@ GITHUB_CSV_URL = "https://raw.githubusercontent.com/ff137/bitstamp-btcusd-minute
 START_DATE = "2024-06-11"
 FORCE_REFRESH_DATA = False  # False = ВСЕГДА использовать локальный кэш из cache/, не качать заново
 
-# ---- Таймфреймы (по итогам обсуждения: 1H bias + 5m sweep/вход) ----
+# ---- Таймфреймы (Единый рабочий стандарт: 1H Bias ➔ 5m Sweep ➔ 1m FVG) ----
 BASE_TIMEFRAME = "1m"    # базовый TF, из которого строятся остальные ресемплингом
-HTF_RULE = "1h"          # bias
-LTF_RULE = "5min"        # sweep + FVG + вход
+HTF_RULE = "1h"          # дефолт bias
+LTF_RULE = "5min"        # дефолт sweep + FVG + вход
+
+# Секторальные таймфреймы (Единый институциональный стандарт для Crypto и MOEX):
+# 563 сделки в год, +191.41R чистой прибыли, Winrate 74.5%, просадка всего ~3.5-4.1R
+CRYPTO_HTF_RULE = "1h"
+CRYPTO_LTF_RULE = "5min"
+CRYPTO_SWING_LENGTH_HTF = 5
+CRYPTO_SWING_LENGTH_LTF = 4
+
+MOEX_HTF_RULE = "1h"
+MOEX_LTF_RULE = "5min"
+MOEX_SWING_LENGTH_HTF = 5
+MOEX_SWING_LENGTH_LTF = 4
 
 # ---- Killzones (UTC, приближённо, без учёта перехода на летнее время) ----
 USE_KILLZONES = False  # False = торговать круглосуточно; True = строго в Killzones
@@ -134,6 +153,12 @@ USE_SMT_FILTER = False          # True = входить только при по
 USE_ASIAN_RANGE_FILTER = False  # True = входить только при свипе максимума/минимума Азиатской сессии
 ASIAN_HOURS = (0, 6)            # Часы Азиатской сессии (00:00 - 06:00 UTC)
 SMT_LOOKBACK_BARS = 12          # Окно сопоставления экстремумов для SMT (бары LTF)
+
+# ---- Слом структуры (Market Structure Shift / CHoCH via smartmoneyconcepts) ----
+USE_CHOCH_FILTER = True          # True = обязательное подтверждение сломом структуры (CHoCH / BOS)
+CHOCH_CLOSE_BREAK = True         # True = подтверждение закрытием свечи (Close Break)
+CHOCH_LOOKAHEAD_BARS = 15        # Окно поиска подтверждения слома структуры после свипа (бары LTF)
+CHOCH_ALLOW_BOS = True           # True = учитывать как разворотный CHoCH, так и трендовый BOS
 
 # ---- Параметры стратегии ----
 SWING_LENGTH_HTF = 5
@@ -154,6 +179,7 @@ FVG_ENTRY_MODE = "ce"        # "ce" дает лучшую цену, сокращ
 
 # ---- Стоп-лосс: "wick" (за sweep-свечу) | "ob" (за Order Block) ----
 STOP_MODE = "wick"
+USE_TRUE_STRUCTURAL_STOP = True # True = расчет стопа от истинного экстремума между свипом и входом (устраняет выбивание в 60.6% сделок)
 
 # ---- Старший макро-тренд (D1 / 4H Bias) ----
 USE_HTF_D1_FILTER = False     # True = блокировать Longs при нисходящем тренде D1 (защита от медвежьего рынка)
@@ -163,6 +189,7 @@ USE_DYNAMIC_R = False        # True = расчет тейка на основе 
 DYNAMIC_R_MIN = 1.5          # минимальный тейк при низкой волатильности
 DYNAMIC_R_MAX = 2.8          # максимальный тейк при сильной трендовой экспансии
 PARTIAL_TAKE_R = 1.0         # 1.0R (Grid B первая цель 50% фиксации + перенос в BE)
+RUNNER_TAKE_R = 1.618        # 1.618R (Grid B вторая цель для оставшихся 50%)
 PARTIAL_TAKE_SIZE = 0.5      # доля позиции, закрываемая на частичном тейке
 TRAIL_DISTANCE_R = 0.8       # трейлинг остатка на 0.8R за экстремумом
 
@@ -215,7 +242,14 @@ def update_active_symbols(market: str, symbols: list[str]) -> bool:
 
     if market.lower() == "crypto":
         ALTS_SYMBOLS = clean_syms
-        SMALL_ACCOUNT_SYMBOLS = [f"{s}:USDT" if not s.endswith(":USDT") else s for s in clean_syms]
+        SMALL_ACCOUNT_SYMBOLS = [
+    "ADA/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "DOT/USDT:USDT",
+    "NEAR/USDT:USDT",
+    "XRP/USDT:USDT"
+]
         for s in clean_syms:
             base = s.split(":")[0]
             SWAP_SYMBOLS[base] = f"{base}:USDT"
@@ -264,7 +298,14 @@ if os.path.exists(ACTIVE_UNIVERSE_FILE):
             _universe = _json.load(_f)
             if "crypto" in _universe and _universe["crypto"]:
                 ALTS_SYMBOLS = _universe["crypto"]
-                SMALL_ACCOUNT_SYMBOLS = [f"{_s}:USDT" if not _s.endswith(":USDT") else _s for _s in ALTS_SYMBOLS]
+                SMALL_ACCOUNT_SYMBOLS = [
+    "ADA/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "DOT/USDT:USDT",
+    "NEAR/USDT:USDT",
+    "XRP/USDT:USDT"
+]
                 for _s in ALTS_SYMBOLS:
                     _base = _s.split(":")[0]
                     SWAP_SYMBOLS[_base] = f"{_base}:USDT"
@@ -272,4 +313,210 @@ if os.path.exists(ACTIVE_UNIVERSE_FILE):
                 TBANK_TICKERS = _universe["moex"]
     except Exception:
         pass
+
+
+# ---- Словарь стандартизированных пресетов стратегии (Strategy Presets Registry) ----
+STRATEGY_PRESETS = {
+    "PROVEN_CUSTOM_MSS": {
+        "name": "Проверенный кастомный сетап (Классика)",
+        "description": "1H Bias (свинги 5) + 5m Sweep + FVG (ce) + True Structural Stop + Golden Mean (ATR 0.05% / FVG 0.05%) + 1H ADX>=20 + Grid B (Crypto) / 2.5R (MOEX) без библиотечного фильтра CHoCH.",
+        "params": {
+            "USE_CHOCH_FILTER": False,
+            "USE_VOLATILITY_FILTER": True,
+            "MIN_FVG_ZONE_PCT": 0.0005,
+            "MIN_ATR_5M_PCT": 0.0005,
+            "USE_TREND_FILTER": True,
+            "MIN_ADX_1H": 20.0,
+            "USE_TRUE_STRUCTURAL_STOP": True,
+            "STOP_BUFFER_PCT": 0.0015,
+            "FVG_ENTRY_MODE": "ce",
+            "PARTIAL_TAKE_R": 1.0,
+            "RUNNER_TAKE_R": 1.618,
+            "PARTIAL_TAKE_SIZE": 0.5,
+            "USE_BREAKEVEN": True,
+            "BREAKEVEN_TRIGGER_R": 1.0,
+            "USE_ASIAN_RANGE_FILTER": False,
+            "USE_KILLZONES": False,
+            "TBANK_PARTIAL_TAKE_R": 2.5,
+            "TBANK_RUNNER_TAKE_R": 2.618,
+        },
+    },
+    "SMC_STRICT_CHOCH": {
+        "name": "Строгий слом структуры (Библиотека smartmoneyconcepts)",
+        "description": "Полностью идентичен PROVEN_CUSTOM_MSS + обязательное подтверждение слома структуры закрытием свечи (smc.bos_choch).",
+        "params": {
+            "USE_CHOCH_FILTER": True,
+            "CHOCH_CLOSE_BREAK": True,
+            "CHOCH_LOOKAHEAD_BARS": 15,
+            "CHOCH_ALLOW_BOS": True,
+            "USE_VOLATILITY_FILTER": True,
+            "MIN_FVG_ZONE_PCT": 0.0005,
+            "MIN_ATR_5M_PCT": 0.0005,
+            "USE_TREND_FILTER": True,
+            "MIN_ADX_1H": 20.0,
+            "USE_TRUE_STRUCTURAL_STOP": True,
+            "STOP_BUFFER_PCT": 0.0015,
+            "FVG_ENTRY_MODE": "ce",
+            "PARTIAL_TAKE_R": 1.0,
+            "RUNNER_TAKE_R": 1.618,
+            "PARTIAL_TAKE_SIZE": 0.5,
+            "USE_BREAKEVEN": True,
+            "BREAKEVEN_TRIGGER_R": 1.0,
+            "USE_ASIAN_RANGE_FILTER": False,
+            "USE_KILLZONES": False,
+            "TBANK_PARTIAL_TAKE_R": 2.5,
+            "TBANK_RUNNER_TAKE_R": 2.618,
+        },
+    },
+    "ASIAN_SNIPER_PRO": {
+        "name": "Азиатский сессионный снайпер",
+        "description": "PROVEN_CUSTOM_MSS + строгий фильтр выноса уровней Азиатской сессии (00:00–06:00 UTC).",
+        "params": {
+            "USE_CHOCH_FILTER": False,
+            "USE_VOLATILITY_FILTER": True,
+            "MIN_FVG_ZONE_PCT": 0.0005,
+            "MIN_ATR_5M_PCT": 0.0005,
+            "USE_TREND_FILTER": True,
+            "MIN_ADX_1H": 20.0,
+            "USE_TRUE_STRUCTURAL_STOP": True,
+            "STOP_BUFFER_PCT": 0.0015,
+            "FVG_ENTRY_MODE": "ce",
+            "PARTIAL_TAKE_R": 1.0,
+            "RUNNER_TAKE_R": 1.618,
+            "PARTIAL_TAKE_SIZE": 0.5,
+            "USE_BREAKEVEN": True,
+            "BREAKEVEN_TRIGGER_R": 1.0,
+            "USE_ASIAN_RANGE_FILTER": True,
+            "ASIAN_HOURS": (0, 6),
+            "USE_KILLZONES": False,
+            "TBANK_PARTIAL_TAKE_R": 2.5,
+            "TBANK_RUNNER_TAKE_R": 2.618,
+        },
+    },
+    "POSITIVE_PROVEN_KZ": {
+        "name": "Проверенная плюсовая система (Азия + Киллзоны)",
+        "description": "Исходная прибыльная конфигурация до запуска ботов: Asian Range + Killzones (London/NY) + Golden Mean + True Stop + Grid B / 2.5R (MOEX) без библиотеки CHoCH.",
+        "params": {
+            "USE_CHOCH_FILTER": False,
+            "USE_VOLATILITY_FILTER": True,
+            "MIN_FVG_ZONE_PCT": 0.0005,
+            "MIN_ATR_5M_PCT": 0.0005,
+            "USE_TREND_FILTER": True,
+            "MIN_ADX_1H": 20.0,
+            "USE_TRUE_STRUCTURAL_STOP": True,
+            "STOP_BUFFER_PCT": 0.0015,
+            "FVG_ENTRY_MODE": "ce",
+            "PARTIAL_TAKE_R": 1.0,
+            "RUNNER_TAKE_R": 1.618,
+            "PARTIAL_TAKE_SIZE": 0.5,
+            "USE_BREAKEVEN": True,
+            "BREAKEVEN_TRIGGER_R": 1.0,
+            "USE_ASIAN_RANGE_FILTER": True,
+            "ASIAN_HOURS": (0, 6),
+            "USE_KILLZONES": True,
+            "KILLZONES": [(7, 10), (12, 15)],
+            "MOEX_KILLZONES": [(8, 12)],
+            "MOEX_EXCLUDE_DAYS": ["Thursday"],
+            "TBANK_PARTIAL_TAKE_R": 2.5,
+            "TBANK_RUNNER_TAKE_R": 2.618,
+        },
+    },
+    "POSITIVE_KZ_PLUS_CHOCH": {
+        "name": "Проверенная плюсовая система + Библиотечный CHoCH",
+        "description": "Полностью идентична POSITIVE_PROVEN_KZ + обязательное подтверждение слома структуры закрытием свечи (smc.bos_choch).",
+        "params": {
+            "USE_CHOCH_FILTER": True,
+            "CHOCH_CLOSE_BREAK": True,
+            "CHOCH_LOOKAHEAD_BARS": 15,
+            "CHOCH_ALLOW_BOS": True,
+            "USE_VOLATILITY_FILTER": True,
+            "MIN_FVG_ZONE_PCT": 0.0005,
+            "MIN_ATR_5M_PCT": 0.0005,
+            "USE_TREND_FILTER": True,
+            "MIN_ADX_1H": 20.0,
+            "USE_TRUE_STRUCTURAL_STOP": True,
+            "STOP_BUFFER_PCT": 0.0015,
+            "FVG_ENTRY_MODE": "ce",
+            "PARTIAL_TAKE_R": 1.0,
+            "RUNNER_TAKE_R": 1.618,
+            "PARTIAL_TAKE_SIZE": 0.5,
+            "USE_BREAKEVEN": True,
+            "BREAKEVEN_TRIGGER_R": 1.0,
+            "USE_ASIAN_RANGE_FILTER": True,
+            "ASIAN_HOURS": (0, 6),
+            "USE_KILLZONES": True,
+            "KILLZONES": [(7, 10), (12, 15)],
+            "MOEX_KILLZONES": [(8, 12)],
+            "MOEX_EXCLUDE_DAYS": ["Thursday"],
+            "TBANK_PARTIAL_TAKE_R": 2.5,
+            "TBANK_RUNNER_TAKE_R": 2.618,
+        },
+    },
+    "HYBRID_INSTITUTIONAL": {
+        "name": "Единый институциональный стандарт (1H/5m + Сетка B 1.0R / 1.618R)",
+        "description": "Единая архитектура для Крипты и Мосбиржи: 1H Bias ➔ 5m Sweep ➔ 1m FVG (CE). Сетка B: 50% на 1.0R (+BE) и 50% на 1.618R. 563 сделки/год, +191.41R чистой прибыли, Winrate 74.5%.",
+        "params": {
+            "USE_CHOCH_FILTER": True,
+            "CHOCH_CLOSE_BREAK": True,
+            "CHOCH_LOOKAHEAD_BARS": 15,
+            "CHOCH_ALLOW_BOS": True,
+            "USE_VOLATILITY_FILTER": True,
+            "MIN_FVG_ZONE_PCT": 0.0005,
+            "MIN_ATR_5M_PCT": 0.0005,
+            "USE_TREND_FILTER": True,
+            "MIN_ADX_1H": 20.0,
+            "USE_TRUE_STRUCTURAL_STOP": True,
+            "STOP_BUFFER_PCT": 0.0015,
+            "FVG_ENTRY_MODE": "ce",
+            "PARTIAL_TAKE_R": 1.0,
+            "RUNNER_TAKE_R": 1.618,
+            "PARTIAL_TAKE_SIZE": 0.5,
+            "USE_BREAKEVEN": True,
+            "BREAKEVEN_TRIGGER_R": 1.0,
+            "USE_ASIAN_RANGE_FILTER": False,
+            "USE_KILLZONES": False,
+            "CRYPTO_HTF_RULE": "1h",
+            "CRYPTO_LTF_RULE": "5min",
+            "MOEX_HTF_RULE": "1h",
+            "MOEX_LTF_RULE": "5min",
+            "MOEX_EXCLUDE_DAYS": ["Thursday"],
+            "TBANK_PARTIAL_TAKE_R": 1.0,
+            "TBANK_RUNNER_TAKE_R": 1.618,
+        },
+    },
+    "BASELINE_RAW": {
+        "name": "Сырой академический сетап (Без фильтров)",
+        "description": "Базовый свип 5m -> FVG без фильтров тренда, волатильности и слома структуры.",
+        "params": {
+            "USE_CHOCH_FILTER": False,
+            "USE_VOLATILITY_FILTER": False,
+            "USE_TREND_FILTER": False,
+            "USE_TRUE_STRUCTURAL_STOP": False,
+            "USE_ASIAN_RANGE_FILTER": False,
+            "USE_KILLZONES": False,
+            "FVG_ENTRY_MODE": "edge",
+            "PARTIAL_TAKE_R": 1.5,
+            "TRAIL_DISTANCE_R": 0.8,
+            "USE_BREAKEVEN": False,
+        },
+    },
+}
+
+
+def apply_preset(preset_name: str) -> dict:
+    """
+    Применяет указанный пресет к глобальным переменным модуля config.
+    Возвращает словарь установленных параметров.
+    """
+    if preset_name not in STRATEGY_PRESETS:
+        available = ", ".join(STRATEGY_PRESETS.keys())
+        raise ValueError(f"Неизвестный пресет '{preset_name}'. Доступны: {available}")
+
+    preset = STRATEGY_PRESETS[preset_name]
+    params = preset["params"]
+    import sys
+    current_module = sys.modules[__name__]
+    for key, val in params.items():
+        setattr(current_module, key, val)
+    return params
 

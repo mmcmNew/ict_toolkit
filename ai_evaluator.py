@@ -76,7 +76,15 @@ def _rule_based_evaluation(setup: dict) -> dict:
         score += 2
         strengths.append("Институциональное подтверждение SMT-дивергенцией между BTC и ETH")
 
-    # 7. Дистанция риска
+    # 7. Слом структуры (Market Structure Shift / CHoCH)
+    if setup.get("choch_confirmed", False):
+        score += 2
+        strengths.append(f"Институциональный слом структуры ({setup.get('choch_type', 'CHoCH')}) подтвержден")
+    elif getattr(cfg, "USE_CHOCH_FILTER", True):
+        score -= 2
+        risks.append("Слом структуры (CHoCH / MSS) не подтвержден — риск ложного входа во флэте")
+
+    # 8. Дистанция риска
     risk_pct = setup.get("risk_pct", 0.0)
     if risk_pct >= 0.004:
         score += 1
@@ -135,11 +143,12 @@ def evaluate_setup(setup: dict, market_context: dict = None) -> dict:
 1. ПРИОРИТЕТ МАКРО-ТРЕНДА (D1): Торговля против дневного тренда D1 строго наказывается (макс. 4 балла). Если D1 Bullish — нельзя шортить; если D1 Bearish — нельзя лонговать (особенно на акциях РФ).
 2. ДИСЦИПЛИНА КИЛЛЗОН: Сетапы вне активных сессий (07:00-10:00 и 12:00-15:00 UTC / 11:00-15:00 MSK) не имеют институционального спонсорства — штраф -2 балла.
 3. МИНИМАЛЬНЫЙ СТОП-ЛОСС: Стоп менее 0.25% уязвим для микро-сквизов и комиссий — считать ловушкой (штраф -2 балла). Оптимальный стоп: 0.35% - 0.75%.
-4. ФАКТОРЫ СЛИЯНИЯ (CONFLUENCE): Свип азиатской ликвидности (Judas Swing), Order Block в зоне и SMT-дивергенция повышают вероятность и дают +1..+2 балла.
+4. ПОДТВЕРЖДЕНИЕ СЛОМОМ СТРУКТУРЫ (CHoCH / MSS): Импульсный слом противоположного экстремума (Swing High для Long, Swing Low для Short) после свипа подтверждает институциональный разворот (+2 балла). Если слом отсутствует, сетап рискует оказаться боковым распилом.
+5. ФАКТОРЫ СЛИЯНИЯ (CONFLUENCE): Свип азиатской ликвидности (Judas Swing), Order Block в зоне и SMT-дивергенция повышают вероятность и дают +1..+2 балла.
 
 Эталонные архетипы (Few-Shot Examples):
-- Архетип 1 (ЭТАЛОН: 9/10, TAKE): D1 Bearish (-1), 1H Bearish (-1). Свип азиатского максимума внутри London Killzone прямо в медвежий Order Block. Формирование FVG с входом на 50% CE, стоп 0.45%. -> TAKE.
-- Архетип 2 (ЛОВУШКА ЛИКВИДНОСТИ: 3/10, SKIP): D1 Bullish (+1), ралли рынка. На 5m локальный свип хая, попытка войти в SHORT против дневного тренда. Order Block отсутствует, стоп 0.18%. -> SKIP (Retail trap, гарантированный стоп).
+- Архетип 1 (ЭТАЛОН: 9/10, TAKE): D1 Bearish (-1), 1H Bearish (-1). Свип азиатского максимума внутри London Killzone прямо в медвежий Order Block. Импульсный слом структуры (CHoCH) на 5m. Формирование FVG с входом на 50% CE, стоп 0.45%. -> TAKE.
+- Архетип 2 (ЛОВУШКА ЛИКВИДНОСТИ: 3/10, SKIP): D1 Bullish (+1), ралли рынка. На 5m локальный свип хая, попытка войти в SHORT против дневного тренда. Order Block и CHoCH отсутствуют, стоп 0.18%. -> SKIP (Retail trap, гарантированный стоп).
 - Архетип 3 (СЖАТИЕ В ДИАПАЗОНЕ: 5/10, CAUTION): D1 Neutral, Daily ATR сжат. Свип в середине 3-дневного боковика, цели далекие. -> CAUTION (риск возврата в безубыток 0R).
 
 Данные оцениваемого сетапа:
@@ -151,11 +160,15 @@ def evaluate_setup(setup: dict, market_context: dict = None) -> dict:
 - Macro Trend (D1): {'BULLISH (1)' if setup.get('d1_bias') == 1 else 'BEARISH (-1)' if setup.get('d1_bias') == -1 else 'NEUTRAL'}
 - 14-day Daily ATR: {setup.get('daily_atr', 'N/A')}
 - Внутри Killzone: {setup.get('in_killzone', False)}
+- Снятый уровень ликвидности: {setup.get('level_name', setup.get('level_type', 'Локальный фрактал'))} @ {setup.get('level_price', 'N/A')}
 - Свип экстремума Азиатской сессии: {setup.get('is_asian_sweep', False)} ({setup.get('asian_type', 'N/A')})
+- Величина прокола уровня: {setup.get('penetration_pct', 'N/A')}%
+- Подтверждение слома структуры (CHoCH / BOS): {setup.get('choch_confirmed', False)} (Тип: {setup.get('choch_type', 'N/A')}, Уровень: {setup.get('choch_level', 'N/A')})
 - Наличие SMT-дивергенции: {setup.get('has_smt', False)}
 - FVG зона: {setup.get('zone_pct', 0.0)*100:.3f}% (Top: {setup.get('fvg_top')}, Bottom: {setup.get('fvg_bottom')}, 50% CE: {setup.get('fvg_ce')})
 - Наличие Order Block: {setup.get('has_ob', False)}
 - Дистанция риска (стоп): {setup.get('risk_pct', 0.0)*100:.3f}%
+- Целевой тейк-профит: {setup.get('rr_ratio', '1.0R (TP1/BE) / 1.618R (TP2)')}
 
 Дополнительный контекст:
 {json.dumps(market_context or {}, ensure_ascii=False, indent=2)}
@@ -170,18 +183,36 @@ def evaluate_setup(setup: dict, market_context: dict = None) -> dict:
   "reasoning": <четкое профессиональное обоснование решения в 2-3 предложениях>
 }}
 """
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.2,
-            )
-        )
+        candidate_models = ["gemini-flash-latest", "gemini-2.5-flash"]
+        if model_name not in candidate_models:
+            candidate_models.insert(0, model_name)
 
-        result = json.loads(response.text)
-        result["source"] = f"gemini_{model_name}"
-        return result
+        last_err = None
+        for m in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=m,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    )
+                )
+                result = json.loads(response.text)
+                result["source"] = f"gemini_{m}"
+                result["score"] = int(result.get("score", 5))
+                result["recommendation"] = str(result.get("recommendation", "CAUTION")).upper()
+                result["confluence_strengths"] = list(result.get("confluence_strengths", []))
+                result["risk_factors"] = list(result.get("risk_factors", []))
+                result["reasoning"] = str(result.get("reasoning", ""))
+                return result
+            except Exception as model_err:
+                last_err = model_err
+                continue
+
+        fallback = _rule_based_evaluation(setup)
+        fallback["reasoning"] += f" (Gemini API unavailable: {last_err})"
+        return fallback
 
     except Exception as e:
         fallback = _rule_based_evaluation(setup)

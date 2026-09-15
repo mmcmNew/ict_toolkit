@@ -160,22 +160,36 @@ def simulate_grid_b(df_1m: pd.DataFrame, df_htf: pd.DataFrame, df_ltf: pd.DataFr
             if not trend_ok:
                 continue
 
-        # 4. Проверка исполнения лимитного ордера на 50% CE в окне MAX_WAIT_MIN
+        # 4. Проверка исполнения лимитного ордера в окне MAX_WAIT_MIN (ce или edge)
+        fvg_mode = getattr(cfg, "FVG_ENTRY_MODE", "ce")
         ce_price = c.get("fvg_ce", (c["fvg_top"] + c["fvg_bottom"]) / 2.0)
-        search_path = df_1m[df_1m.index > c["confirm_time"]].head(max_wait_min)
+        search_pos = df_1m.index.searchsorted(c["confirm_time"], side="right")
+        search_path = df_1m.iloc[search_pos : search_pos + max_wait_min]
         fill_time, fill_price = None, None
 
         for t, r in search_path.iterrows():
-            if exp_dir == 1:
-                if r["low"] <= ce_price and r["high"] >= c["fvg_bottom"]:
-                    fill_price = ce_price
-                    fill_time = t
-                    break
-            else:
-                if r["high"] >= ce_price and r["low"] <= c["fvg_top"]:
-                    fill_price = ce_price
-                    fill_time = t
-                    break
+            if fvg_mode == "ce":
+                if exp_dir == 1:
+                    if r["low"] <= ce_price and r["high"] >= c["fvg_bottom"]:
+                        fill_price = ce_price
+                        fill_time = t
+                        break
+                else:
+                    if r["high"] >= ce_price and r["low"] <= c["fvg_top"]:
+                        fill_price = ce_price
+                        fill_time = t
+                        break
+            else:  # edge entry
+                if exp_dir == 1:
+                    if r["low"] <= c["fvg_top"]:
+                        fill_price = min(r["high"], c["fvg_top"])
+                        fill_time = t
+                        break
+                else:
+                    if r["high"] >= c["fvg_bottom"]:
+                        fill_price = max(r["low"], c["fvg_bottom"])
+                        fill_time = t
+                        break
 
         if fill_time is None:
             continue  # ордер не исполнен (цена не вернулась в зону)
@@ -186,21 +200,42 @@ def simulate_grid_b(df_1m: pd.DataFrame, df_htf: pd.DataFrame, df_ltf: pd.DataFr
             if len(active_until) >= max_positions:
                 continue
 
-        # 6. Расчет структурного стоп-лосса и риска
+        # 6. Расчет истинного структурного стоп-лосса и риска
         buffer = fill_price * buffer_pct
-        stop = (c["sweep_candle_low"] - buffer) if exp_dir == 1 else (c["sweep_candle_high"] + buffer)
+        use_true_struct_stop = getattr(cfg, "USE_TRUE_STRUCTURAL_STOP", True)
+        if use_true_struct_stop:
+            path_between = df_1m.loc[c["sweep_time"] : fill_time]
+            if len(path_between) > 0:
+                if exp_dir == 1:
+                    struct_low = min(c["sweep_candle_low"], path_between["low"].min())
+                    stop = struct_low - buffer
+                else:
+                    struct_high = max(c["sweep_candle_high"], path_between["high"].max())
+                    stop = struct_high + buffer
+            else:
+                stop = (c["sweep_candle_low"] - buffer) if exp_dir == 1 else (c["sweep_candle_high"] + buffer)
+        else:
+            stop = (c["sweep_candle_low"] - buffer) if exp_dir == 1 else (c["sweep_candle_high"] + buffer)
+
         risk = (fill_price - stop) if exp_dir == 1 else (stop - fill_price)
 
         if risk <= 0 or (risk / fill_price) < min_risk_pct:
             continue
 
-        cost_r = (fill_price * fee_pct) / risk
-        fee_cost = fill_price * fee_pct
+        cost_r = (fill_price * fee_pct * 2.2) / risk
+        fee_cost = fill_price * (fee_pct * 2.2)
         be_stop = (fill_price + fee_cost) if exp_dir == 1 else (fill_price - fee_cost)
 
-        # 7. Цели Grid B
-        tp1_price = (fill_price + 1.0 * risk) if exp_dir == 1 else (fill_price - 1.0 * risk)
-        tp2_price = (fill_price + 1.618 * risk) if exp_dir == 1 else (fill_price - 1.618 * risk)
+        # 7. Цели Grid (Crypto vs MOEX)
+        if is_moex:
+            tp1_r = getattr(cfg, "TBANK_PARTIAL_TAKE_R", 2.5)
+            tp2_r = getattr(cfg, "TBANK_RUNNER_TAKE_R", 2.618)
+        else:
+            tp1_r = getattr(cfg, "PARTIAL_TAKE_R", 1.0)
+            tp2_r = getattr(cfg, "RUNNER_TAKE_R", 1.618)
+
+        tp1_price = (fill_price + tp1_r * risk) if exp_dir == 1 else (fill_price - tp1_r * risk)
+        tp2_price = (fill_price + tp2_r * risk) if exp_dir == 1 else (fill_price - tp2_r * risk)
 
         # 8. ИИ-оценка перед входом
         ai_score, ai_rec, ai_reason = None, None, None
@@ -228,7 +263,8 @@ def simulate_grid_b(df_1m: pd.DataFrame, df_htf: pd.DataFrame, df_ltf: pd.DataFr
                 continue
 
         # 9. Эмуляция удержания позиции и отработки сетки Grid B
-        future = df_1m[df_1m.index > fill_time].head(max_hold_min)
+        future_pos = df_1m.index.searchsorted(fill_time, side="right")
+        future = df_1m.iloc[future_pos : future_pos + max_hold_min]
         if len(future) == 0:
             continue
 
@@ -268,11 +304,11 @@ def simulate_grid_b(df_1m: pd.DataFrame, df_htf: pd.DataFrame, df_ltf: pd.DataFr
                     exit_reason = "BE_STOP" if is_be_active else "INITIAL_STOP"
                     break
 
-            # Проверка этапов сетки Grid B
+            # Проверка этапов сетки Grid
             if stage == 0:
                 hit_tp1 = (h >= tp1_price) if exp_dir == 1 else (l <= tp1_price)
                 if hit_tp1:
-                    banked_r += 0.5 * 1.0  # зафиксировано +0.50R
+                    banked_r += 0.5 * tp1_r  # зафиксировано 50% объема
                     rem_pos = 0.5
                     is_be_active = True
                     current_stop = be_stop  # стоп перенесен в безубыток
@@ -281,11 +317,11 @@ def simulate_grid_b(df_1m: pd.DataFrame, df_htf: pd.DataFrame, df_ltf: pd.DataFr
             if stage == 1:
                 hit_tp2 = (h >= tp2_price) if exp_dir == 1 else (l <= tp2_price)
                 if hit_tp2:
-                    banked_r += 0.5 * 1.618  # зафиксировано +0.809R
+                    banked_r += 0.5 * tp2_r  # зафиксировано оставшиеся 50%
                     rem_pos = 0.0
                     exit_time = t
                     exit_price = tp2_price
-                    exit_reason = "GRID_B_FULL_TP"
+                    exit_reason = "GRID_FULL_TP"
                     break
 
         if stopped:

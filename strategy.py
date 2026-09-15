@@ -173,10 +173,32 @@ def find_candidates(df_htf, df_ltf, cfg, df_1m=None, smt_df=None):
     fvg_ltf = smc.fvg(df_ltf)
     fvg_ltf.index = df_ltf.index
 
-    ob_ltf = smc.ob(df_ltf, swings_ltf)
-    ob_ltf.index = df_ltf.index
-    ob_bull = ob_ltf[ob_ltf["OB"] == 1]
-    ob_bear = ob_ltf[ob_ltf["OB"] == -1]
+    # Расчет слома структуры (Market Structure Shift / CHoCH / BOS)
+    use_choch = getattr(cfg, "USE_CHOCH_FILTER", True)
+    break_events = {}
+    if use_choch:
+        close_break = getattr(cfg, "CHOCH_CLOSE_BREAK", True)
+        choch_df = smc.bos_choch(df_ltf, swings_ltf, close_break=close_break)
+        for idx, row in choch_df.iterrows():
+            b_idx = row.get("BrokenIndex")
+            if pd.notna(b_idx):
+                b_int = int(b_idx)
+                if b_int not in break_events:
+                    break_events[b_int] = []
+                c_val = row.get("CHOCH")
+                b_val = row.get("BOS")
+                if pd.notna(c_val) and c_val != 0:
+                    break_events[b_int].append(("CHOCH", int(c_val), float(row["Level"])))
+                if pd.notna(b_val) and b_val != 0:
+                    break_events[b_int].append(("BOS", int(b_val), float(row["Level"])))
+
+    use_ob = getattr(cfg, "USE_OB_FILTER", False)
+    ob_bull, ob_bear = None, None
+    if use_ob:
+        ob_ltf = smc.ob(df_ltf, swings_ltf)
+        ob_ltf.index = df_ltf.index
+        ob_bull = ob_ltf[ob_ltf["OB"] == 1]
+        ob_bear = ob_ltf[ob_ltf["OB"] == -1]
 
     # Вычисление уровней Азиатской сессии при наличии минутных данных
     asian_ranges = compute_asian_ranges(df_1m, getattr(cfg, "ASIAN_HOURS", (0, 6))) if df_1m is not None else {}
@@ -269,9 +291,33 @@ def find_candidates(df_htf, df_ltf, cfg, df_1m=None, smt_df=None):
             continue
         confirm_time = df_ltf.index[fvg_bar_pos + 1]
 
-        ob_pool = (ob_bull if expected_dir == 1 else ob_bear)
-        ob_pool = ob_pool[ob_pool.index <= sweep_time]
-        ob_candidate = ob_pool.iloc[-1].to_dict() if len(ob_pool) else None
+        # Фильтр слома структуры CHoCH / BOS (Market Structure Shift)
+        choch_info = None
+        if use_choch:
+            lookahead = getattr(cfg, "CHOCH_LOOKAHEAD_BARS", 15)
+            allow_bos = getattr(cfg, "CHOCH_ALLOW_BOS", True)
+            has_break = False
+            for b in range(max(0, swept_bar_idx - 1), min(len(df_ltf), fvg_bar_pos + lookahead + 1)):
+                for ev_type, ev_dir, lvl in break_events.get(b, []):
+                    if ev_dir == expected_dir:
+                        if ev_type == "CHOCH" or (allow_bos and ev_type == "BOS"):
+                            has_break = True
+                            choch_info = {
+                                "choch_type": ev_type,
+                                "choch_level": lvl,
+                                "choch_time": df_ltf.index[b]
+                            }
+                            break
+                if has_break:
+                    break
+            if not has_break:
+                continue
+
+        ob_candidate = None
+        if use_ob and ob_bull is not None:
+            ob_pool = (ob_bull if expected_dir == 1 else ob_bear)
+            ob_pool = ob_pool[ob_pool.index <= sweep_time]
+            ob_candidate = ob_pool.iloc[-1].to_dict() if len(ob_pool) else None
 
         fvg_ce = (float(fvg_top) + float(fvg_bottom)) / 2.0
         daily_atr = None
@@ -320,6 +366,10 @@ def find_candidates(df_htf, df_ltf, cfg, df_1m=None, smt_df=None):
             is_asian_sweep=is_asian,
             asian_type=asian_type,
             has_smt=has_smt,
+            choch_confirmed=bool(choch_info is not None),
+            choch_type=choch_info["choch_type"] if choch_info else None,
+            choch_level=choch_info["choch_level"] if choch_info else None,
+            choch_time=choch_info["choch_time"] if choch_info else None,
         ))
 
     # Сортируем кандидатов строго хронологически по времени подтверждения

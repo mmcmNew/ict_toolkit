@@ -1,3 +1,6 @@
-trades,wins,losses,winrate,total_r,avg_r,profit_factor,max_dd_r,long_trades,short_trades,symbol
-79,35,44,44.3,4.93,0.062,1.1,9.31,51,28,ADA/USDT
-79,35,44,44.3,4.93,0.062,1.1,9.31,51,28,PORTFOLIO TOTAL
+trades,wins,losses,winrate,total_r,avg_r,profit_factor,max_dd_r,recovery_ratio,score,long_trades,short_trades,symbol
+27,20,7,74.1,7.04,0.261,1.86,3.53,1.99,5.47,20,7,SOL/USDT
+15,10,5,66.7,0.42,0.028,1.07,2.3,0.18,0.26,7,8,XRP/USDT
+17,9,8,52.9,-0.94,-0.055,0.9,4.7,0.0,0.0,11,6,BTC/USDT
+20,11,9,55.0,2.02,0.101,1.2,5.21,0.39,0.51,13,7,ETH/USDT
+79,50,29,63.3,8.54,0.108,1.25,5.26,,,51,28,PORTFOLIO TOTAL

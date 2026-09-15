@@ -44,6 +44,7 @@ from trend_filter import is_market_trending
 import telegram_notifier as tg
 import chart_generator as cg
 import pending_signals as ps
+import liquidity_sentry as sentry
 
 DATA_DIR = getattr(cfg, "DATA_DIR", "data")
 SEEN_SIGNALS_PATH = getattr(cfg, "SEEN_SIGNALS_FILE", os.path.join(DATA_DIR, "live_seen_signals.json"))
@@ -777,6 +778,7 @@ def execute_or_propose_entry(
     is_ar_sweep=False,
     ar_type=None,
     timeframe_entry="5m",
+    choch_info=None,
 ):
     """
     Универсальный исполнитель сделки:
@@ -839,7 +841,8 @@ def execute_or_propose_entry(
         )
         return False
 
-    print(f"\n⚡ ОБНАРУЖЕН ВАЛИДНЫЙ СЕТАП ({timeframe_entry.upper()} ВХОД): {swap_symbol} | {dir_str} по {current_price:.4f}")
+    choch_desc = f" | MSS: {choch_info['choch_type']} @ {choch_info['choch_level']:.4f}" if choch_info else ""
+    print(f"\n⚡ ОБНАРУЖЕН ВАЛИДНЫЙ СЕТАП ({timeframe_entry.upper()} ВХОД): {swap_symbol} | {dir_str} по {current_price:.4f}{choch_desc}")
     print(f"   Время свипа: {sweep_time} UTC | FVG: [{fvg_bottom:.4f} - {fvg_top:.4f}]")
     print(f"   Расчетный SL: {stop:.4f} | TP1 (1.0R): {tp1:.4f} | TP2 (1.618R): {target:.4f}")
     print(f"   Размер позиции: {pos_calc['position_usdt']:.1f} USDT (Риск: {pos_calc['risk_pct']:.1f}% = ${pos_calc['risk_usd']:.2f})")
@@ -847,7 +850,9 @@ def execute_or_propose_entry(
     score = None
     rec = None
     ai_eval = {}
-    if args.ai:
+    use_ai = getattr(args, "ai", False) or getattr(cfg, "ENABLE_AI_EVALUATION", True)
+    if use_ai:
+        lvl_name = f"Asian Range {ar_type}" if (args.asian_range and is_ar_sweep) else f"{timeframe_entry.upper()} Swing {'Low (SSL)' if expected_dir == 1 else 'High (BSL)'}"
         eval_payload = {
             "symbol": swap_symbol,
             "expected_dir": expected_dir,
@@ -855,19 +860,37 @@ def execute_or_propose_entry(
             "confirm_time": str(datetime.now(timezone.utc)),
             "bias": bias,
             "in_killzone": in_killzone(sweep_time, cfg.KILLZONES),
-            "asian_range_sweep": args.asian_range,
+            "asian_range_sweep": bool(args.asian_range and is_ar_sweep),
+            "asian_type": ar_type,
+            "level_name": lvl_name,
+            "level_price": float(sweep_candle["low"] if expected_dir == 1 else sweep_candle["high"]),
             "zone_pct": zone_pct,
             "fvg_top": fvg_top,
             "fvg_bottom": fvg_bottom,
             "risk_pct": risk / current_price,
+            "rr_ratio": f"{cfg.PARTIAL_TAKE_R:.1f}R / {cfg.RUNNER_TAKE_R:.3f}R",
+            "choch_confirmed": bool(choch_info is not None),
+            "choch_type": choch_info.get("choch_type") if choch_info else None,
+            "choch_level": choch_info.get("choch_level") if choch_info else None,
+            "choch_time": choch_info.get("choch_time") if choch_info else None,
         }
         ai_eval = evaluate_setup(eval_payload)
         score = ai_eval.get("score", 5)
         rec = ai_eval.get("recommendation", "CAUTION")
-        print(f"🤖 ИИ-ОЦЕНКА: {score}/10 | Рекомендация: {rec} ({ai_eval.get('source')})")
+        print(f"🤖 ИИ-ОЦЕНКА (Gemini): {score}/10 | Рекомендация: {rec} ({ai_eval.get('source')})")
         print(f"   Вывод: {ai_eval.get('reasoning')}")
         if rec == "SKIP" or score < cfg.AI_CONFIDENCE_THRESHOLD:
             print(f"⛔ Вход отклонен ИИ (Score {score} < {cfg.AI_CONFIDENCE_THRESHOLD} или SKIP).")
+            tg.notify_ai_rejection(
+                market="Bitget Crypto",
+                symbol=swap_symbol,
+                direction="LONG" if expected_dir == 1 else "SHORT",
+                price=current_price,
+                ai_score=score,
+                recommendation=rec,
+                risk_factors=ai_eval.get("risk_factors", []),
+                reasoning=ai_eval.get("reasoning", ""),
+            )
             seen.add(sig_key)
             return False
 
@@ -876,6 +899,7 @@ def execute_or_propose_entry(
         "bias_desc": "BULLISH" if expected_dir == 1 else "BEARISH",
         "sweep_time": str(sweep_time),
         "sweep_price": float(sweep_candle["low"] if expected_dir == 1 else sweep_candle["high"]),
+        "level_name": f"Asian Range {ar_type}" if (args.asian_range and is_ar_sweep) else f"{timeframe_entry.upper()} Swing {'Low (SSL)' if expected_dir == 1 else 'High (BSL)'}",
         "fvg_bottom": float(fvg_bottom),
         "fvg_top": float(fvg_top),
         "fvg_zone_pct": round(float(zone_pct) * 100, 2),
@@ -883,9 +907,14 @@ def execute_or_propose_entry(
         "asian_range_sweep": bool(args.asian_range and is_ar_sweep),
         "asian_range_type": ar_type if (args.asian_range and is_ar_sweep) else None,
         "in_killzone": bool(args.killzones and in_killzone(sweep_time, cfg.KILLZONES)),
-        "ai_score": score if args.ai else None,
-        "ai_recommendation": rec if args.ai else None,
-        "ai_reasoning": ai_eval.get("reasoning") if args.ai else None,
+        "choch_confirmed": bool(choch_info is not None),
+        "choch_type": choch_info.get("choch_type") if choch_info else None,
+        "choch_level": choch_info.get("choch_level") if choch_info else None,
+        "ai_score": score if use_ai else None,
+        "ai_recommendation": rec if use_ai else None,
+        "ai_reasoning": ai_eval.get("reasoning") if use_ai else None,
+        "ai_strengths": ai_eval.get("confluence_strengths", []) if use_ai else [],
+        "ai_risks": ai_eval.get("risk_factors", []) if use_ai else [],
         "timeframe_entry": timeframe_entry,
     }
 
@@ -1003,19 +1032,50 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
         if symbol_states.get(sym, {}).get("state") == "ARMED":
             continue
 
-        try:
-            df_htf = fetch_recent(exchange, sym, timeframe="1h", limit=60)
-            if df_htf is None or len(df_htf) < cfg.SWING_LENGTH_HTF * 2:
-                continue
-            bias_series = compute_bias_series(df_htf, cfg.SWING_LENGTH_HTF)
+        htf_str = getattr(args, "htf", None) or getattr(cfg, "CRYPTO_HTF_RULE", "4h")
+        ltf_str = getattr(args, "ltf", None) or getattr(cfg, "CRYPTO_LTF_RULE", "15min")
+        htf_ccxt = htf_str.replace("min", "m")
+        ltf_ccxt = ltf_str.replace("min", "m")
+        htf_swings = getattr(cfg, "CRYPTO_SWING_LENGTH_HTF", 5)
+        ltf_swings = getattr(cfg, "CRYPTO_SWING_LENGTH_LTF", 4)
 
-            df_5m = fetch_recent(exchange, sym, timeframe="5m", limit=120)
-            if df_5m is None or len(df_5m) < cfg.SWING_LENGTH_LTF * 2 + 5:
+        try:
+            df_htf = fetch_recent(exchange, sym, timeframe=htf_ccxt, limit=100)
+            if df_htf is None or len(df_htf) < htf_swings * 2:
+                continue
+            bias_series = compute_bias_series(df_htf, htf_swings)
+
+            df_5m = fetch_recent(exchange, sym, timeframe=ltf_ccxt, limit=120)
+            if df_5m is None or len(df_5m) < ltf_swings * 2 + 5:
                 continue
 
             # Отсекаем формирующийся бар, анализируем закрытые свечи
             df_closed = df_5m.iloc[:-1].copy()
             current_price = df_5m["close"].iloc[-1]
+
+            # Синхронизация карты ликвидности для команды /levels
+            try:
+                lmap = sentry.load_liquidity_map()
+                if "crypto" not in lmap.get("markets", {}):
+                    lmap.setdefault("markets", {})["crypto"] = {"symbols": {}}
+                existing_lvls = lmap["markets"]["crypto"]["symbols"].get(sym, {}).get("levels", [])
+                sym_lvls = sentry.extract_symbol_liquidity_levels(
+                    symbol=sym,
+                    df_1h=df_htf,
+                    df_5m=df_closed,
+                    current_price=current_price,
+                    asian_hours=cfg.ASIAN_HOURS,
+                    existing_levels=existing_lvls,
+                )
+                lmap["markets"]["crypto"]["symbols"][sym] = {
+                    "current_price": current_price,
+                    "state": symbol_states.get(sym, {}).get("state", "SENTRY"),
+                    "levels": sym_lvls,
+                    "updated_at": now_utc_dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                }
+                sentry.save_liquidity_map(lmap)
+            except Exception:
+                pass
 
             # Проверка волатильности рынка (ATR 14 в % от цены для защиты от мертвого боковика)
             if getattr(cfg, "USE_VOLATILITY_FILTER", True):
@@ -1084,17 +1144,58 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
                         continue
 
                 buffer = current_price * getattr(cfg, "STOP_BUFFER_PCT", 0.0015)
-                stop = (sweep_candle["low"] - buffer) if expected_dir == 1 else (sweep_candle["high"] + buffer)
+                # Истинный структурный стоп: учитывает экстремумы от момента свипа до текущей точки входа
+                window_since_sweep = df_5m[(df_5m.index >= sweep_time)] if "df_5m" in locals() and df_5m is not None else None
+                if window_since_sweep is not None and len(window_since_sweep) > 0:
+                    if expected_dir == 1:
+                        struct_ext = min(float(sweep_candle["low"]), float(window_since_sweep["low"].min()))
+                        stop = struct_ext - buffer
+                    else:
+                        struct_ext = max(float(sweep_candle["high"]), float(window_since_sweep["high"].max()))
+                        stop = struct_ext + buffer
+                else:
+                    stop = (sweep_candle["low"] - buffer) if expected_dir == 1 else (sweep_candle["high"] + buffer)
+
                 risk = abs(current_price - stop)
                 if risk <= 0 or risk / current_price < cfg.MIN_RISK_PCT:
                     seen.add(sig_key)
                     continue
 
+                # Проверка слома структуры CHoCH / BOS (Market Structure Shift)
+                use_choch = getattr(cfg, "USE_CHOCH_FILTER", True)
+                choch_5m_info = None
+                if use_choch:
+                    close_break = getattr(cfg, "CHOCH_CLOSE_BREAK", True)
+                    allow_bos = getattr(cfg, "CHOCH_ALLOW_BOS", True)
+                    choch_df = smc.bos_choch(df_closed, swings_5m, close_break=close_break)
+                    for _, crow in choch_df.iterrows():
+                        b_idx = crow.get("BrokenIndex")
+                        if pd.notna(b_idx):
+                            b_int = int(b_idx)
+                            if swept_bar_idx - 1 <= b_int < len(df_closed):
+                                c_val = crow.get("CHOCH")
+                                b_val = crow.get("BOS")
+                                if pd.notna(c_val) and int(c_val) == expected_dir:
+                                    choch_5m_info = {
+                                        "choch_type": "CHOCH",
+                                        "choch_level": float(crow["Level"]),
+                                        "choch_time": str(df_closed.index[b_int]),
+                                    }
+                                    break
+                                elif allow_bos and pd.notna(b_val) and int(b_val) == expected_dir:
+                                    choch_5m_info = {
+                                        "choch_type": "BOS",
+                                        "choch_level": float(crow["Level"]),
+                                        "choch_time": str(df_closed.index[b_int]),
+                                    }
+                                    break
+
                 # Проверка: есть ли уже 5m FVG и тест ценой прямо сейчас
                 window_5m = fvg_5m[(fvg_5m.index > sweep_time)].head(15)
                 matching_5m = window_5m[window_5m["FVG"] == expected_dir]
                 entered_5m = False
-                if len(matching_5m) > 0:
+                # Без подтверждения структуры 5m вход не совершается
+                if len(matching_5m) > 0 and (not use_choch or choch_5m_info is not None):
                     fvg_top, fvg_bottom = matching_5m.iloc[0]["Top"], matching_5m.iloc[0]["Bottom"]
                     zone_pct = (fvg_top - fvg_bottom) / fvg_bottom
                     min_fvg = getattr(cfg, "MIN_FVG_ZONE_PCT", 0.0015)
@@ -1122,7 +1223,8 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
                                 asian_ranges=asian_ranges,
                                 is_ar_sweep=is_ar_sweep,
                                 ar_type=ar_type,
-                                timeframe_entry="5m",
+                                timeframe_entry=ltf_ccxt,
+                                choch_info=choch_5m_info,
                             )
                             if entered_5m:
                                 break
@@ -1133,6 +1235,10 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
                 # Если вход еще не состоялся - взводим инструмент на 1m охоту
                 dir_str = "LONG" if expected_dir == 1 else "SHORT"
                 sweep_p = float(sweep_candle["low"] if expected_dir == 1 else sweep_candle["high"])
+                lvl_type = "ASIAN_" + ar_type if (args.asian_range and is_ar_sweep and ar_type) else (f"{ltf_ccxt.upper()}_SSL" if expected_dir == 1 else f"{ltf_ccxt.upper()}_BSL")
+                lvl_name = f"Asian Range {ar_type}" if (args.asian_range and is_ar_sweep) else f"{ltf_ccxt.upper()} Swing {'Low (SSL)' if expected_dir == 1 else 'High (BSL)'}"
+                hunt_min = getattr(cfg, "HUNT_TIMEOUT_MINUTES", 45)
+
                 symbol_states[sym] = {
                     "state": "ARMED",
                     "armed_data": {
@@ -1142,6 +1248,8 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
                         "sweep_time": sweep_time,
                         "sweep_candle": sweep_candle,
                         "sweep_price": sweep_p,
+                        "level_name": lvl_name,
+                        "level_type": lvl_type,
                         "stop": stop,
                         "bias": bias,
                         "df_htf": df_htf,
@@ -1150,12 +1258,59 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
                         "is_ar_sweep": is_ar_sweep,
                         "ar_type": ar_type,
                         "armed_at": now_utc_dt,
-                        "expires_at": now_utc_dt + pd.Timedelta(minutes=25),
+                        "expires_at": now_utc_dt + pd.Timedelta(minutes=hunt_min),
                         "sig_key": sig_key,
+                        "choch_info": choch_5m_info,
                     },
                 }
-                print(f"\n⚡ [ARMED] {sym}: Обнаружен {dir_str} свип на 5m в {sweep_time} UTC!")
-                print(f"   Уровень свипа: {sweep_p:.4f} | Стоп: {stop:.4f} | Окно охоты за 1m FVG: 25 мин.\n")
+                choch_armed_str = f" | MSS: {choch_5m_info['choch_type']} @ {choch_5m_info['choch_level']:.4f} ✅" if choch_5m_info else " | Ожидание MSS"
+                print(f"\n⚡ [ARMED] {sym}: Обнаружен {dir_str} свип на 5m в {sweep_time} UTC!{choch_armed_str}")
+                print(f"   Уровень свипа: {sweep_p:.4f} ({lvl_name}) | Стоп: {stop:.4f} | Окно охоты за 1m FVG: {hunt_min} мин.\n")
+
+                level_p = float(row.get("Level", sweep_p)) if "Level" in row else sweep_p
+                sw_wick = float(sweep_candle["low"] if expected_dir == 1 else sweep_candle["high"])
+                penetration = round(abs(sw_wick - level_p) / level_p * 100, 2) if level_p > 0 else 0.0
+
+                # Фиксация персистентного состояния охоты для /status и рекавери
+                try:
+                    sentry.set_hunt_state(
+                        market="crypto",
+                        symbol=sym,
+                        hunt_data={
+                            "level_name": lvl_name,
+                            "level_type": lvl_type,
+                            "level_price": level_p,
+                            "trigger_price": sw_wick,
+                            "direction": expected_dir,
+                            "dir_str": dir_str,
+                            "sweep_time": str(sweep_time),
+                            "hunt_window_min": hunt_min,
+                            "stop": stop,
+                        }
+                    )
+                except Exception as sentry_err:
+                    print(f"⚠️ Ошибка сохранения hunt_state: {sentry_err}")
+
+                sweep_alert_key = f"sweep_notified_{sym}_{sweep_time}"
+                if sweep_alert_key not in seen:
+                    seen.add(sweep_alert_key)
+                    save_seen(seen)
+                    try:
+                        tg.notify_sweep_detected(
+                            market="Bitget Crypto",
+                            symbol=sym,
+                            level_type=lvl_type,
+                            level_name=lvl_name,
+                            level_price=level_p,
+                            trigger_price=sw_wick,
+                            direction=expected_dir,
+                            bias_desc="BULLISH" if bias == 1 else "BEARISH",
+                            in_killzone=in_killzone(sweep_time, cfg.KILLZONES),
+                            penetration_pct=penetration,
+                            hunt_window_min=hunt_min,
+                        )
+                    except Exception as tg_err:
+                        print(f"⚠️ Ошибка отправки алерта свипа в Telegram: {tg_err}")
                 break
         except Exception as e:
             print(f"⚠️ Ошибка сканирования {sym}: {e}")
@@ -1175,6 +1330,7 @@ def check_armed_symbol_1m(exchange, sym, armed_data, seen, args, symbol_states):
     now_utc_dt = datetime.now(timezone.utc)
     if now_utc_dt >= armed_data["expires_at"]:
         print(f"\n⏰ [{sym}] Время ожидания входа (25 мин) истекло без теста FVG. Сброс в IDLE.\n")
+        sentry.clear_hunt_state("crypto", sym, reason="EXPIRED")
         symbol_states[sym]["state"] = "IDLE"
         symbol_states[sym]["armed_data"] = None
         return
@@ -1192,12 +1348,14 @@ def check_armed_symbol_1m(exchange, sym, armed_data, seen, args, symbol_states):
         if expected_dir == 1 and current_price <= stop:
             print(f"\n❌ [{sym}] СЕТАП АННУЛИРОВАН: цена ({current_price:.4f}) пробила Low свипа ({stop:.4f}). Сброс в IDLE.\n")
             seen.add(armed_data["sig_key"])
+            sentry.clear_hunt_state("crypto", sym, reason="INVALIDATED")
             symbol_states[sym]["state"] = "IDLE"
             symbol_states[sym]["armed_data"] = None
             return
         elif expected_dir == -1 and current_price >= stop:
             print(f"\n❌ [{sym}] СЕТАП АННУЛИРОВАН: цена ({current_price:.4f}) пробила High свипа ({stop:.4f}). Сброс в IDLE.\n")
             seen.add(armed_data["sig_key"])
+            sentry.clear_hunt_state("crypto", sym, reason="INVALIDATED")
             symbol_states[sym]["state"] = "IDLE"
             symbol_states[sym]["armed_data"] = None
             return
@@ -1220,8 +1378,45 @@ def check_armed_symbol_1m(exchange, sym, armed_data, seen, args, symbol_states):
         if not (fvg_bottom - buffer_in <= current_price <= fvg_top + buffer_in):
             return
 
+        # Проверка слома структуры CHoCH / BOS (Market Structure Shift)
+        use_choch = getattr(cfg, "USE_CHOCH_FILTER", True)
+        choch_info = armed_data.get("choch_info")
+        if use_choch and not choch_info:
+            close_break = getattr(cfg, "CHOCH_CLOSE_BREAK", True)
+            allow_bos = getattr(cfg, "CHOCH_ALLOW_BOS", True)
+            swings_1m = smc.swing_highs_lows(df_1m, swing_length=3)
+            choch_1m = smc.bos_choch(df_1m, swings_1m, close_break=close_break)
+            sweep_ts = armed_data["sweep_time"]
+            for _, crow in choch_1m.iterrows():
+                b_idx = crow.get("BrokenIndex")
+                if pd.notna(b_idx):
+                    b_int = int(b_idx)
+                    if 0 <= b_int < len(df_1m) and df_1m.index[b_int] >= sweep_ts:
+                        c_val = crow.get("CHOCH")
+                        b_val = crow.get("BOS")
+                        if pd.notna(c_val) and int(c_val) == expected_dir:
+                            choch_info = {
+                                "choch_type": "CHOCH (1m)",
+                                "choch_level": float(crow["Level"]),
+                                "choch_time": str(df_1m.index[b_int]),
+                            }
+                            armed_data["choch_info"] = choch_info
+                            break
+                        elif allow_bos and pd.notna(b_val) and int(b_val) == expected_dir:
+                            choch_info = {
+                                "choch_type": "BOS (1m)",
+                                "choch_level": float(crow["Level"]),
+                                "choch_time": str(df_1m.index[b_int]),
+                            }
+                            armed_data["choch_info"] = choch_info
+                            break
+            if not choch_info:
+                # Ожидаем слома структуры в рамках 1m окна охоты
+                return
+
         # Снайперский вход подтвержден!
-        print(f"\n🎯 [1M SNIPER] {sym}: Обнаружен и протестирован 1m FVG [{fvg_bottom:.4f} - {fvg_top:.4f}] по {current_price:.4f}!")
+        choch_sniper_str = f" [MSS: {choch_info['choch_type']} @ {choch_info['choch_level']:.4f}]" if choch_info else ""
+        print(f"\n🎯 [1M SNIPER] {sym}: Обнаружен и протестирован 1m FVG [{fvg_bottom:.4f} - {fvg_top:.4f}] по {current_price:.4f}!{choch_sniper_str}")
         entered = execute_or_propose_entry(
             exchange=exchange,
             swap_symbol=sym,
@@ -1244,8 +1439,10 @@ def check_armed_symbol_1m(exchange, sym, armed_data, seen, args, symbol_states):
             is_ar_sweep=armed_data["is_ar_sweep"],
             ar_type=armed_data["ar_type"],
             timeframe_entry="1m",
+            choch_info=choch_info,
         )
         if entered:
+            sentry.clear_hunt_state("crypto", sym, reason="ENTERED")
             symbol_states[sym]["state"] = "IN_TRADE"
             symbol_states[sym]["armed_data"] = None
     except Exception as e:
@@ -1367,6 +1564,8 @@ def main():
     parser.add_argument("--force-leverage", action="store_true", help="Разрешить торговлю парами с высоким минимальным контрактом (с принудительным плечом)")
     parser.add_argument("--confirm", action="store_true", help="Запрашивать подтверждение сделок через Telegram для всех сделок со скриншотом")
     parser.add_argument("-y", "--yes", action="store_true", help="Автоматическое подтверждение запуска на реальном счете")
+    parser.add_argument("--htf", type=str, default=getattr(cfg, "CRYPTO_HTF_RULE", "4h"), help="Старший таймфрейм Bias (по умолчанию: 4h)")
+    parser.add_argument("--ltf", type=str, default=getattr(cfg, "CRYPTO_LTF_RULE", "15min"), help="Младший таймфрейм свипа/FVG (по умолчанию: 15min)")
     parser.add_argument("--stats", action="store_true", help="Показать детальную статистику сделок, комиссий и PnL и выйти")
     args = parser.parse_args()
 
@@ -1419,6 +1618,55 @@ def main():
 
     seen = load_seen()
     symbol_states = {sym: {"state": "IDLE", "armed_data": None} for sym in target_symbols}
+
+    # Восстановление активных режимов Охоты из bot_state.json при перезапуске
+    try:
+        b_state = sentry.load_bot_state()
+        crypto_syms = b_state.get("markets", {}).get("crypto", {}).get("symbols", {})
+        recovered_count = 0
+        now_utc_dt = datetime.now(timezone.utc)
+        for sym, sinfo in crypto_syms.items():
+            if sinfo.get("state") == "HUNTING" and sinfo.get("hunt_data"):
+                hd = sinfo["hunt_data"]
+                exp_str = hd.get("expires_at")
+                if exp_str:
+                    exp_dt = pd.to_datetime(exp_str)
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.tz_localize("UTC")
+                    else:
+                        exp_dt = exp_dt.tz_convert("UTC")
+                    if exp_dt > now_utc_dt:
+                        rem_m = max(1, int((exp_dt - now_utc_dt).total_seconds() // 60))
+                        if sym in symbol_states:
+                            symbol_states[sym] = {
+                                "state": "ARMED",
+                                "armed_data": {
+                                    "symbol": sym,
+                                    "direction": int(hd.get("direction", 1)),
+                                    "dir_str": str(hd.get("dir_str", "LONG")),
+                                    "sweep_time": pd.to_datetime(hd.get("sweep_time")),
+                                    "sweep_price": float(hd.get("level_price", 0.0)),
+                                    "level_name": str(hd.get("level_name", "Уровень")),
+                                    "level_type": str(hd.get("level_type", "")),
+                                    "stop": float(hd.get("stop", 0.0)),
+                                    "bias": int(hd.get("direction", 1)),
+                                    "df_htf": None,
+                                    "df_5m": None,
+                                    "asian_ranges": {},
+                                    "is_ar_sweep": False,
+                                    "ar_type": None,
+                                    "armed_at": pd.to_datetime(hd.get("armed_at")),
+                                    "expires_at": exp_dt,
+                                    "sig_key": f"{sym}_{hd.get('sweep_time')}",
+                                },
+                            }
+                            recovered_count += 1
+                            print(f"🏹 [RESTART RECOVERY] {sym}: Восстановлен активный свип {hd.get('level_name')} @ {hd.get('level_price')}! Охота активна (осталось {rem_m} мин.)")
+        if recovered_count > 0:
+            print(f"⚡ Успешно восстановлено активных охот: {recovered_count}\n")
+    except Exception as e:
+        print(f"⚠️ Ошибка восстановления состояния охоты: {e}")
+
     last_5m_checked_bucket = None
     last_1m_checked_bucket = None
     last_in_trade_check_time = 0.0
@@ -1528,26 +1776,30 @@ def main():
                 for sym in armed_symbols:
                     check_armed_symbol_1m(exchange, sym, symbol_states[sym]["armed_data"], seen, args, symbol_states)
 
-            # 4. Фаза 1 (IDLE): Сканирование 5m баров на закрытии свечи (:00, :05, :10...) или на первом старте
-            minute_5_boundary = (now_utc_dt.minute // 5) * 5
-            now_5m_bucket = f"{now_utc_dt.strftime('%Y-%m-%d %H')}:{minute_5_boundary:02d}"
-            is_initial_start = (last_5m_checked_bucket is None)
-            is_5m_candle_close = (now_utc_dt.minute % 5 == 0 and now_utc_dt.second >= 2)
+            # 4. Фаза 1 (IDLE): Сканирование LTF баров на закрытии свечи или на первом старте
+            htf_str = getattr(args, "htf", None) or getattr(cfg, "CRYPTO_HTF_RULE", "4h")
+            ltf_str = getattr(args, "ltf", None) or getattr(cfg, "CRYPTO_LTF_RULE", "15min")
+            ltf_min = 15 if "15" in ltf_str else (5 if "5" in ltf_str else 1)
 
-            if is_initial_start or (is_5m_candle_close and last_5m_checked_bucket != now_5m_bucket):
-                last_5m_checked_bucket = now_5m_bucket
-                scan_reason = "Первый старт" if is_initial_start else "Закрытие 5m свечи"
-                print(f"\n[{now_utc} UTC] ⏱️ {scan_reason}. Сканирование {len(target_symbols)} пар на 5m свипы ликвидности...")
+            minute_ltf_boundary = (now_utc_dt.minute // ltf_min) * ltf_min
+            now_ltf_bucket = f"{now_utc_dt.strftime('%Y-%m-%d %H')}:{minute_ltf_boundary:02d}"
+            is_initial_start = (last_5m_checked_bucket is None)
+            is_ltf_candle_close = (now_utc_dt.minute % ltf_min == 0 and now_utc_dt.second >= 2)
+
+            if is_initial_start or (is_ltf_candle_close and last_5m_checked_bucket != now_ltf_bucket):
+                last_5m_checked_bucket = now_ltf_bucket
+                scan_reason = "Первый старт" if is_initial_start else f"Закрытие {ltf_str} свечи"
+                print(f"\n[{now_utc} UTC] ⏱️ {scan_reason}. Сканирование {len(target_symbols)} пар на {ltf_str} свипы ликвидности...")
                 scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states)
                 last_status_log_time = now_epoch
 
             save_seen(seen)
 
-            # Расчет секунд до следующей 5-минутной свечи
-            sec_into_5m = (now_utc_dt.minute % 5) * 60 + now_utc_dt.second
-            sec_to_5m = (302 - sec_into_5m) % 300
-            if sec_to_5m == 0:
-                sec_to_5m = 300
+            # Расчет секунд до следующей LTF свечи
+            sec_into_ltf = (now_utc_dt.minute % ltf_min) * 60 + now_utc_dt.second
+            sec_to_ltf = ((ltf_min * 60 + 2) - sec_into_ltf) % (ltf_min * 60)
+            if sec_to_ltf == 0:
+                sec_to_ltf = ltf_min * 60
 
             # Дискретный периодический лог (не чаще одного раза в poll_sec, например раз в 30 сек)
             poll_interval = getattr(args, "poll_sec", 30) or 30
@@ -1555,7 +1807,7 @@ def main():
                 last_status_log_time = now_epoch
                 status_armed = f" | 🎯 Взведено: {len(armed_symbols)}" if armed_symbols else ""
                 status_pos = f" | 💼 Позиций: {len(open_trades)}" if open_trades else ""
-                print(f"[{now_utc} UTC] Мониторинг {len(target_symbols)} пар (Риск {risk_pct:.1f}%){status_pos}{status_armed} | До 5m закрытия: {sec_to_5m}с")
+                print(f"[{now_utc} UTC] Мониторинг {len(target_symbols)} пар ({htf_str.upper()}/{ltf_str.upper()}, Риск {risk_pct:.1f}%){status_pos}{status_armed} | До {ltf_str} закрытия: {sec_to_ltf}с")
 
         except KeyboardInterrupt:
             print("\n🛑 Бот остановлен пользователем.")
@@ -1568,7 +1820,7 @@ def main():
         # 1. Если есть сигналы на одобрение в TG -> спим 2 сек для моментальной реакции
         # 2. Если есть открытая позиция (IN_TRADE) -> опрашиваем тикер каждые 5 сек
         # 3. Если есть взведенные пары (ARMED) -> ждем закрытия 1m свечи (до :02 сек следующей минуты)
-        # 4. Если в режиме ожидания (IDLE) -> ждем закрытия 5m свечи или интервал poll_sec (30 сек)
+        # 4. Если в режиме ожидания (IDLE) -> ждем закрытия LTF свечи или интервал poll_sec (30 сек)
         if ps.has_pending_signals(market="bitget"):
             sleep_target = 2
         elif open_trades:
@@ -1579,7 +1831,7 @@ def main():
                 sec_to_1m = 60
             sleep_target = min(10, max(2, sec_to_1m))
         else:
-            sleep_target = min(poll_interval, max(5, sec_to_5m))
+            sleep_target = min(poll_interval, max(5, sec_to_ltf))
 
         # Спим заданное время с проверкой прерывания при появлении сигнала из TG
         for _ in range(sleep_target):

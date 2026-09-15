@@ -180,13 +180,33 @@ def notify_setup_proposal(
         sweep_p = setup_reason.get("sweep_price", 0.0)
         fvg_bot = setup_reason.get("fvg_bottom", 0.0)
         fvg_top = setup_reason.get("fvg_top", 0.0)
+        lvl_name = setup_reason.get("level_name")
+        if lvl_name:
+            sr_lines.append(f"📍 <b>Снят уровень:</b> {html.escape(lvl_name)}")
         if bias:
             sr_lines.append(f"💡 <b>Сетап:</b> {bias} свип @ {sweep_p:,.4f}")
+        choch_conf = setup_reason.get("choch_confirmed")
+        choch_tp = setup_reason.get("choch_type")
+        choch_lvl = setup_reason.get("choch_level")
+        if choch_conf and choch_tp:
+            lvl_str = f" @ {choch_lvl:,.4f}" if choch_lvl else ""
+            sr_lines.append(f"🔄 <b>Структурный слом (MSS):</b> {html.escape(str(choch_tp))}{lvl_str} ✅")
         if fvg_bot and fvg_top:
             sr_lines.append(f"📐 <b>FVG зона:</b> [{fvg_bot:,.4f} — {fvg_top:,.4f}]")
         ai_score = setup_reason.get("ai_score")
+        ai_rec = setup_reason.get("ai_recommendation")
         if ai_score is not None:
-            sr_lines.append(f"🧠 <b>AI Score:</b> {ai_score}/10")
+            rec_str = f" ({ai_rec})" if ai_rec else ""
+            sr_lines.append(f"🧠 <b>AI Оценка:</b> <code>{ai_score}/10</code>{rec_str}")
+        strengths = setup_reason.get("ai_strengths", [])
+        if strengths and isinstance(strengths, list):
+            sr_lines.append("  ✅ <i>" + html.escape("; ".join(strengths[:2])) + "</i>")
+        risks = setup_reason.get("ai_risks", [])
+        if risks and isinstance(risks, list):
+            sr_lines.append("  ⚠️ <i>" + html.escape("; ".join(risks[:2])) + "</i>")
+        ai_reason = setup_reason.get("ai_reasoning")
+        if ai_reason:
+            sr_lines.append(f"  💬 <i>{html.escape(ai_reason)}</i>")
 
     setup_block = ("\n" + "\n".join(sr_lines)) if sr_lines else ""
     header = "💡 <b>ПРЕДЛОЖЕНИЕ СДЕЛКИ (ВНЕ КИЛЛЗОНЫ)</b>" if is_off_session else "⚡ <b>ПРЕДЛОЖЕНИЕ СДЕЛКИ (ТРЕБУЕТСЯ ПОДТВЕРЖДЕНИЕ)</b>"
@@ -267,13 +287,33 @@ def notify_trade_opened(
         sweep_p = setup_reason.get("sweep_price", 0.0)
         fvg_bot = setup_reason.get("fvg_bottom", 0.0)
         fvg_top = setup_reason.get("fvg_top", 0.0)
+        lvl_name = setup_reason.get("level_name")
+        if lvl_name:
+            sr_lines.append(f"📍 <b>Снят уровень:</b> {html.escape(lvl_name)}")
         if bias:
-            sr_lines.append(f"💡 <b>Сетап:</b> {bias} свип @ {sweep_p:,.2f}")
+            sr_lines.append(f"💡 <b>Сетап:</b> {bias} свип @ {sweep_p:,.4f}")
+        choch_conf = setup_reason.get("choch_confirmed")
+        choch_tp = setup_reason.get("choch_type")
+        choch_lvl = setup_reason.get("choch_level")
+        if choch_conf and choch_tp:
+            lvl_str = f" @ {choch_lvl:,.4f}" if choch_lvl else ""
+            sr_lines.append(f"🔄 <b>Структурный слом (MSS):</b> {html.escape(str(choch_tp))}{lvl_str} ✅")
         if fvg_bot and fvg_top:
-            sr_lines.append(f"📐 <b>FVG зона:</b> [{fvg_bot:,.2f} — {fvg_top:,.2f}]")
+            sr_lines.append(f"📐 <b>FVG зона:</b> [{fvg_bot:,.4f} — {fvg_top:,.4f}]")
         ai_score = setup_reason.get("ai_score")
+        ai_rec = setup_reason.get("ai_recommendation")
         if ai_score is not None:
-            sr_lines.append(f"🧠 <b>AI Score:</b> {ai_score}/10")
+            rec_str = f" ({ai_rec})" if ai_rec else ""
+            sr_lines.append(f"🧠 <b>AI Оценка:</b> <code>{ai_score}/10</code>{rec_str}")
+        strengths = setup_reason.get("ai_strengths", [])
+        if strengths and isinstance(strengths, list):
+            sr_lines.append("  ✅ <i>" + html.escape("; ".join(strengths[:2])) + "</i>")
+        risks = setup_reason.get("ai_risks", [])
+        if risks and isinstance(risks, list):
+            sr_lines.append("  ⚠️ <i>" + html.escape("; ".join(risks[:2])) + "</i>")
+        ai_reason = setup_reason.get("ai_reasoning")
+        if ai_reason:
+            sr_lines.append(f"  💬 <i>{html.escape(ai_reason)}</i>")
 
     setup_block = ("\n" + "\n".join(sr_lines)) if sr_lines else ""
 
@@ -349,6 +389,72 @@ def notify_trade_closed(
         f"💵 <b>Чистый PnL:</b> <code>{pnl_sign}{net_pnl:,.2f} {html.escape(currency)}</code><b>{r_str}</b>"
         f"{fee_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━"
+    )
+    return send_telegram_message(msg)
+
+
+def notify_sweep_detected(
+    market: str,
+    symbol: str,
+    level_type: str,
+    level_name: str,
+    level_price: float,
+    trigger_price: float,
+    direction: int,
+    bias_desc: str = "",
+    in_killzone: bool = True,
+    penetration_pct: float = 0.0,
+    hunt_window_min: int = 45,
+) -> bool:
+    """Уведомление о проколе (свипе) уровня ликвидности и переходе в режим охоты."""
+    dir_str = "LONG (Поиск отскока вверх)" if direction == 1 else "SHORT (Поиск отскока вниз)"
+    dir_emoji = "🟢" if direction == 1 else "🔴"
+    kz_str = "🟢 Да (Активная сессия)" if in_killzone else "🟡 Вне киллзоны (Контроль)"
+
+    msg = (
+        f"⚡ <b>СВИП ЛИКВИДНОСТИ ОБНАРУЖЕН!</b> [{html.escape(market)}]\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{dir_emoji} <b>Инструмент:</b> <code>{html.escape(symbol)}</code>\n"
+        f"📍 <b>Снят уровень:</b> <b>{html.escape(level_name)}</b>\n"
+        f"🎯 <b>Цена уровня:</b> <code>{level_price:,.4f}</code>\n"
+        f"⚡ <b>Цена прокола:</b> <code>{trigger_price:,.4f}</code> ({penetration_pct:+.2f}%)\n"
+        f"🧭 <b>Ожидаемый вход:</b> <b>{dir_str}</b>\n"
+        f"🕒 <b>Внутри Killzone:</b> {kz_str}\n"
+        f"🏹 <b>Статус:</b> <i>Включен режим Охоты за FVG (окно {hunt_window_min} мин)</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Бот ожидает Displacement + FVG и перед входом запросит оценку у ИИ.</i>"
+    )
+    return send_telegram_message(msg)
+
+
+def notify_ai_rejection(
+    market: str,
+    symbol: str,
+    direction: str,
+    price: float,
+    ai_score: int,
+    recommendation: str,
+    risk_factors: list = None,
+    reasoning: str = "",
+) -> bool:
+    """Уведомление об отклонении потенциальной сделки нейросетью Google Gemini."""
+    dir_emoji = "🟢" if direction.upper() == "LONG" else "🔴"
+    rf_lines = []
+    if risk_factors and isinstance(risk_factors, list):
+        for rf in risk_factors[:3]:
+            rf_lines.append(f"  • {html.escape(str(rf))}")
+    rf_block = ("\n⚠️ <b>Факторы риска:</b>\n" + "\n".join(rf_lines)) if rf_lines else ""
+    reason_str = f"\n💬 <i>{html.escape(reasoning)}</i>" if reasoning else ""
+
+    msg = (
+        f"🛑 <b>СЕТАП ОТКЛОНЕН ИИ (Google Gemini)</b> [{html.escape(market)}]\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{dir_emoji} <b>Инструмент:</b> <code>{html.escape(symbol)}</code> (<b>{direction.upper()}</b> @ {price:,.4f})\n"
+        f"🧠 <b>Оценка ИИ:</b> <code>{ai_score}/10</code> (<b>{html.escape(recommendation)}</b>)"
+        f"{rf_block}"
+        f"{reason_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Сделка отменена риск-офицером ИИ для защиты депозита от ловушки.</i>"
     )
     return send_telegram_message(msg)
 
