@@ -1090,7 +1090,7 @@ def scan_5m_sweeps(exchange, target_symbols, seen, args, symbol_states):
                     # Волатильность усохла - пропускаем сканирование свипов на мертвом рынке
                     continue
 
-            swings_5m = smc.swing_highs_lows(df_closed, swing_length=cfg.SWING_LENGTH_LTF)
+            swings_5m = smc.swing_highs_lows(df_closed, swing_length=ltf_swings)
             liq_5m = smc.liquidity(df_closed, swings_5m, range_percent=cfg.LIQUIDITY_RANGE_PCT)
             liq_5m.index = df_closed.index
             fvg_5m = smc.fvg(df_closed)
@@ -1329,7 +1329,8 @@ def check_armed_symbol_1m(exchange, sym, armed_data, seen, args, symbol_states):
 
     now_utc_dt = datetime.now(timezone.utc)
     if now_utc_dt >= armed_data["expires_at"]:
-        print(f"\n⏰ [{sym}] Время ожидания входа (25 мин) истекло без теста FVG. Сброс в IDLE.\n")
+        hunt_min = getattr(cfg, "HUNT_TIMEOUT_MINUTES", 45)
+        print(f"\n⏰ [{sym}] Время ожидания входа ({hunt_min} мин) истекло без теста FVG. Сброс в IDLE.\n")
         sentry.clear_hunt_state("crypto", sym, reason="EXPIRED")
         symbol_states[sym]["state"] = "IDLE"
         symbol_states[sym]["armed_data"] = None
@@ -1339,6 +1340,14 @@ def check_armed_symbol_1m(exchange, sym, armed_data, seen, args, symbol_states):
         df_1m = fetch_recent(exchange, sym, timeframe="1m", limit=60)
         if df_1m is None or len(df_1m) < 15:
             return
+
+        # После рестарта (recovery) старшие фреймы не восстановлены — догружаем лениво
+        if armed_data.get("df_htf") is None or armed_data.get("df_5m") is None:
+            htf_str = getattr(args, "htf", None) or getattr(cfg, "CRYPTO_HTF_RULE", "4h")
+            ltf_str = getattr(args, "ltf", None) or getattr(cfg, "CRYPTO_LTF_RULE", "15min")
+            armed_data["df_htf"] = fetch_recent(exchange, sym, timeframe=htf_str.replace("min", "m"), limit=100)
+            df_ltf_rec = fetch_recent(exchange, sym, timeframe=ltf_str.replace("min", "m"), limit=120)
+            armed_data["df_5m"] = df_ltf_rec.iloc[:-1].copy() if df_ltf_rec is not None else None
 
         current_price = df_1m["close"].iloc[-1]
         expected_dir = armed_data["direction"]
@@ -1645,6 +1654,10 @@ def main():
                                     "direction": int(hd.get("direction", 1)),
                                     "dir_str": str(hd.get("dir_str", "LONG")),
                                     "sweep_time": pd.to_datetime(hd.get("sweep_time")),
+                                    "sweep_candle": pd.Series({
+                                        k: float(hd.get("trigger_price", hd.get("level_price", 0.0)))
+                                        for k in ("open", "high", "low", "close")
+                                    }),
                                     "sweep_price": float(hd.get("level_price", 0.0)),
                                     "level_name": str(hd.get("level_name", "Уровень")),
                                     "level_type": str(hd.get("level_type", "")),
@@ -1779,7 +1792,8 @@ def main():
             # 4. Фаза 1 (IDLE): Сканирование LTF баров на закрытии свечи или на первом старте
             htf_str = getattr(args, "htf", None) or getattr(cfg, "CRYPTO_HTF_RULE", "4h")
             ltf_str = getattr(args, "ltf", None) or getattr(cfg, "CRYPTO_LTF_RULE", "15min")
-            ltf_min = 15 if "15" in ltf_str else (5 if "5" in ltf_str else 1)
+            _ltf_map = {"1m": 1, "1min": 1, "3m": 3, "3min": 3, "5m": 5, "5min": 5, "15m": 15, "15min": 15, "30m": 30, "30min": 30, "1h": 60, "60min": 60}
+            ltf_min = _ltf_map.get(ltf_str, 15 if "15" in ltf_str else (5 if "5" in ltf_str else 1))
 
             minute_ltf_boundary = (now_utc_dt.minute // ltf_min) * ltf_min
             now_ltf_bucket = f"{now_utc_dt.strftime('%Y-%m-%d %H')}:{minute_ltf_boundary:02d}"
